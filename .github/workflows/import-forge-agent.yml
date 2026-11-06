@@ -1,0 +1,71 @@
+name: Import existing Forge Agent baseline
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/import-forge-agent.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: import-forge-agent-baseline
+  cancel-in-progress: false
+jobs:
+  import:
+    if: github.repository == 'damianwalker356-hub/forge-agent-desktop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out desktop repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          ref: ${{ github.sha }}
+      - name: Verify destination, import exact source, test and commit
+        shell: bash
+        env:
+          SOURCE_SHA: 5b21dc6675a05fd5b6231548bd1de88c1a9bc183
+          INITIAL_DESKTOP_SHA: 16f3d525b8ea4780a0b32972920f51d2a8f274cc
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$INITIAL_DESKTOP_SHA"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$GITHUB_SHA"
+          python3 - <<'PY'
+          import subprocess
+          actual = set(subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')) - {''}
+          expected = {'README.md', '.github/workflows/import-forge-agent.yml'}
+          if actual != expected:
+              raise SystemExit('Destination contains unexpected files; refusing to replace them.')
+          PY
+          git fetch --no-tags --depth=1 https://github.com/damianwalker356-hub/forge-agent.git "$SOURCE_SHA"
+          test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          SOURCE_TREE=$(git rev-parse "${SOURCE_SHA}^{tree}")
+          git read-tree --reset -u "$SOURCE_SHA"
+          test "$(git write-tree)" = "$SOURCE_TREE"
+          npm test
+          (cd forge && bash run_tests.sh)
+          cat > DESKTOP-BASELINE.md <<'EOF'
+          # Forge Agent Desktop baseline
+          
+          This separate desktop repository starts from the complete source tree of
+          damianwalker356-hub/forge-agent at commit
+          5b21dc6675a05fd5b6231548bd1de88c1a9bc183.
+          
+          The original repository is unchanged. Its source files, tests, documentation,
+          validation records and native Forge artifacts were copied as the baseline.
+          Original validation records describe their original runs, not desktop certification.
+          The import runs npm test and forge/run_tests.sh before publishing this commit.
+          It does not run the Chromium browser suite or test Windows, macOS or ARM64.
+          
+          Desktop-specific local project access, an application Run workflow, a portable
+          Forge runtime and target-specific executable packaging are planned, not yet
+          implemented. The copied native Forge backend remains Linux x86-64.
+          This source copy does not transfer browser-local models, skills or user data.
+          
+          The source README is preserved. This file identifies the independent desktop
+          development baseline. The one-time import workflow is removed by the import.
+          EOF
+          git add DESKTOP-BASELINE.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "Import Forge Agent 5b21dc6 as the desktop development baseline"
+          git push origin HEAD:refs/heads/main
