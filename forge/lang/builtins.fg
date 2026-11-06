@@ -1,0 +1,340 @@
+\ builtins.fg — Python builtins, str/list/dict methods and the math/time/random modules for Forge 2.
+\ Builtin signature:  ( args... nargs -- v t )      registered with   ' xt s" name" builtin!
+\ Method signature:   ( obj to args... nargs -- v t ) registered with  ' xt s" name" method!
+\ A method name is shared by every type, so each method dispatches on the receiver tag.
+
+\ ------------------------------------------------------------------ helpers
+: type-name ( t -- addr len ) case 0 of s" int" endof 1 of s" float" endof 2 of s" str" endof 3 of s" list" endof
+   4 of s" NoneType" endof 5 of s" bool" endof 6 of s" dict" endof 7 of s" tuple" endof s" object" rot endcase ;
+: argc-fatal ( name-addr name-len -- ) s" TypeError: " err-type err-type s" () takes a different number of arguments" rt-fatal ;
+: argc= ( nargs n name-addr name-len -- ) swap >r >r <> if r> r> swap argc-fatal then r> r> swap 2drop ;
+: need-type ( t want name-addr name-len -- ) swap >r >r <> if s" TypeError: " err-type r> r> swap err-type s"  expected a different type" rt-fatal then r> r> swap 2drop ;
+: drop-args ( args... nargs -- ) begin dup 0 > while 1- -rot 2drop repeat drop ;
+: vcopy-list ( l -- l' ) 0 over @ l-copy ;
+: cmove-back ( src dst n -- ) begin dup 0 > while 1- >r over r@ + c@ over r@ + c! r> repeat 2drop drop ;
+: l-reverse! ( l -- ) dup @ 2/ 0 begin 2dup > while 2 pick over l-at 2@ 4 pick 3 pick 1+ over @ swap - l-at 2@ 6 pick 5 pick l-at 2!
+   4 pick 3 pick 1+ over @ swap - l-at 2! 1+ repeat 2drop drop ;
+variable acc-v variable acc-t variable best-v variable best-t variable en-start variable jn-total variable rp-old variable rp-new variable tt-flag
+: new-list ( -- l ) 8 mklist ;
+: s-strip-ws? ( c -- f ) dup 32 = over 9 = or over 10 = or swap 13 = or ;
+
+\ ------------------------------------------------------------------ str() int() float() bool() repr() type()
+: b-str ( args nargs -- v t ) dup 0= if drop s" " mkstr 2 exit then 1 s" str" argc= v>str 2 ;
+: b-repr ( v t n -- s 2 ) 1 s" repr" argc= v>repr 2 ;
+: b-type ( v t n -- s 2 ) 1 s" type" argc= nip s" <class '" mkstr swap type-name mkstr s-concat s" '>" mkstr s-concat 2 ;
+: b-bool ( args n -- f 5 ) dup 0= if drop 0 5 exit then 1 s" bool" argc= rt-truthy 5 ;
+variable ps-a variable ps-end
+: ps-c ( -- c ) ps-a @ ps-end @ < if ps-a @ c@ else 0 then ;
+: ps-adv 1 ps-a +! ;
+: ps-skip-ws begin ps-c s-strip-ws? ps-c 0<> and while ps-adv repeat ;
+: ps-start ( s -- ) s>al over + ps-end ! ps-a ! ps-skip-ws ;
+: ps-sign ( -- neg? ) ps-c [char] - = if ps-adv 1 exit then ps-c [char] + = if ps-adv then 0 ;
+: ps-done? ( -- f ) ps-skip-ws ps-a @ ps-end @ >= ;
+: int-value-error ( s -- ) s" ValueError: invalid literal for int(): " err-type v>repr s>al rt-fatal ;
+: str>int ( s -- n ) dup ps-start ps-sign ps-c digit? 0= if drop int-value-error then
+   0 begin ps-c digit? ps-c [char] _ = or while ps-c digit? if 10 * ps-c [char] 0 - + then ps-adv repeat
+   ps-done? 0= if 2drop int-value-error then swap if negate then nip ;
+: float-value-error ( s -- ) s" ValueError: could not convert string to float: " err-type v>repr s>al rt-fatal ;
+: ps-word? ( addr len -- f )  \ case-insensitive match at the cursor; advances past it on success
+   ps-end @ ps-a @ - over < if 2drop 0 exit then
+   0 begin 2dup > while 2 pick over + c@ 32 or ps-a @ 2 pick + c@ 32 or <> if drop 2drop 0 exit then 1+ repeat
+   drop ps-a +! drop 1 ;
+: str>float ( s -- f ) dup ps-start ps-sign >r
+   s" inf" ps-word? s" infinity" ps-word? or if ps-done? 0= if float-value-error then drop 1.0 0.0 f/ r> if fnegate then exit then
+   s" nan" ps-word? if ps-done? 0= if float-value-error then drop 0.0 0.0 f/ r> drop exit then
+   0 nm-mant ! 0 nm-exp ! 0 nm-digits ! 0 nm-float ! 0 nm-n ! 0 nm-dropped !
+   ps-c digit? ps-c [char] . = or 0= if r> drop float-value-error then
+   begin ps-c digit? ps-c [char] _ = or while ps-c digit? if ps-c nm-digit then ps-adv repeat
+   ps-c [char] . = if ps-adv begin ps-c digit? ps-c [char] _ = or while ps-c digit? if ps-c nm-digit -1 nm-exp +! then ps-adv repeat then
+   nm-n @ 0= nm-mant @ 0= and ps-a @ ps-end @ = and if r> drop float-value-error then
+   ps-c 32 or [char] e = if ps-adv ps-sign ps-c digit? 0= if r> drop float-value-error then
+      0 begin ps-c digit? while 10 * ps-c [char] 0 - + ps-adv repeat swap if negate then nm-exp +! then
+   ps-done? 0= if r> drop float-value-error then drop nm-value r> if fnegate then ;
+: b-int ( args n -- n 0 ) dup 0= if drop 0 0 exit then 1 s" int" argc=
+   dup int? if drop 0 exit then dup 1 = if drop dup fnan? if s" ValueError: cannot convert float NaN to integer" rt-fatal then f>s 0 exit then
+   dup 2 = if drop str>int 0 exit then s" TypeError: int() argument must be a string or a number" rt-fatal ;
+: b-float ( args n -- f 1 ) dup 0= if drop 0.0 1 exit then 1 s" float" argc=
+   dup int? if drop s>f 1 exit then dup 1 = if drop 1 exit then dup 2 = if drop str>float 1 exit then
+   s" TypeError: float() argument must be a string or a number" rt-fatal ;
+
+\ ------------------------------------------------------------------ numbers
+: b-abs ( v t n -- v t ) 1 s" abs" argc= dup int? if drop abs 0 exit then dup 1 = if drop fabs 1 exit then s" TypeError: bad operand type for abs()" rt-fatal ;
+: fround-half-even ( f -- f' ) dup fabs 4503599627370496.0 f>= if exit then dup fround s>f dup 0.0 f= if drop dup 0.0 f< if 0.0 fnegate else 0.0 then then nip ;
+: b-round ( args n -- v t ) dup 1 = if drop dup int? if drop 0 exit then dup 1 = if drop fround-half-even f>s 0 exit then s" TypeError: round() needs a number" rt-fatal then
+   2 s" round" argc= int? 0= if s" TypeError: round() second argument must be an int" rt-fatal then >r
+   dup int? if drop r@ 0 >= if r> drop 0 exit then r> negate 10^ dup >r swap s>f swap f/ fround-half-even r> f* f>s 0 exit then
+   1 <> if s" TypeError: round() needs a number" rt-fatal then
+   r@ 0 <= if r> negate 10^ dup >r f/ fround-half-even r> f* 1 exit then
+   dup 0 < >r fabs r> swap r> fixed>str str>float swap if fnegate then 1 ;   \ exact decimal rounding like CPython
+: b-divmod ( a ta b tb n -- tup 7 ) 2 s" divmod" argc= 2over 2over rt% swap >r >r rt// list1 r> r> swap l-append1 7 ;
+: b-pow ( args n -- v t ) 2 s" pow" argc= rt** ;   : b-fpow ( args n -- f 1 ) 2 s" pow" argc= rt** >f 1 ;
+: seq-or-args ( args n -- l ) dup 1 = if drop dup seq? 0= if s" TypeError: argument is not iterable" rt-fatal then drop exit then
+   new-list >r begin dup 0 > while 1- -rot r@ l-append repeat drop r> dup l-reverse! ;
+: minmax ( args n sign -- v t ) >r seq-or-args dup @ 0= if s" ValueError: min()/max() argument is an empty sequence" rt-fatal then
+   dup 0 l-at 2@ best-t ! best-v ! dup @ 1 ( l n i ) begin 2dup > while
+      2 pick over l-at 2@ 2dup best-v @ best-t @ rt-cmp r@ negate = if best-t ! best-v ! else 2drop then 1+ repeat 2drop drop best-v @ best-t @ r> drop ;
+: b-min ( args n -- v t ) 1 minmax ;   : b-max ( args n -- v t ) -1 minmax ;
+: b-sum ( args n -- v t ) dup 1 = if drop 0 0 2 then 2 s" sum" argc= acc-t ! acc-v ! dup seq? 0= if s" TypeError: sum() argument is not iterable" rt-fatal then
+   drop dup @ 0 ( l n i ) begin 2dup > while 2 pick over l-at 2@ acc-v @ acc-t @ 2swap rt+ acc-t ! acc-v ! 1+ repeat 2drop drop acc-v @ acc-t @ ;
+: b-ord ( s t n -- n 0 ) 1 s" ord" argc= 2 s" ord" need-type dup @ 1 <> if s" TypeError: ord() expected a character" rt-fatal then s.bytes c@ 0 ;
+: b-chr ( n t n -- s 2 ) 1 s" chr" argc= int? 0= if s" TypeError: chr() needs an int" rt-fatal then dup 0 256 within 0= if s" ValueError: chr() arg not in range(256) (Forge strings are bytes)" rt-fatal then
+   1 sbuf swap put-char sbuf> 2 ;
+: put-hex ( u -- ) dup 16 < if dup 10 < if [char] 0 + else 87 + then put-char exit then 16 /mod recurse dup 10 < if [char] 0 + else 87 + then put-char ;
+: b-hex ( n t n -- s 2 ) 1 s" hex" argc= int? 0= if s" TypeError: hex() needs an int" rt-fatal then 32 sbuf swap dup 0 < if [char] - put-char negate then s" 0x" put-al put-hex sbuf> 2 ;
+
+\ ------------------------------------------------------------------ sequences
+: b-len ( v t n -- v t ) 1 s" len" argc= dup 2 = over seq? or over 6 = or 0= if s" TypeError: object has no len()" rt-fatal then drop @ 0 ;
+: iter>list ( v t -- l ) dup seq? if drop vcopy-list exit then dup 6 = if drop d-keys exit then
+   dup 2 = if drop new-list >r dup @ 0 begin 2dup > while 2 pick over s-char 2 r@ l-append 1+ repeat 2drop drop r> exit then
+   s" TypeError: object is not iterable" rt-fatal ;
+: b-list ( args n -- l 3 ) dup 0= if drop new-list 3 exit then 1 s" list" argc= iter>list 3 ;
+: b-tuple ( args n -- l 7 ) dup 0= if drop new-list 7 exit then 1 s" tuple" argc= iter>list 7 ;
+: b-range ( args n -- l 3 ) mk-range new-list >r begin dup iter-next while r@ l-append repeat drop r> 3 ;
+: b-reversed ( v t n -- l 3 ) 1 s" reversed" argc= iter>list new-list >r dup @ begin dup 0 > while 1- 2dup l-at 2@ r@ l-append repeat 2drop r> 3 ;
+: b-enumerate ( args n -- l 3 ) dup 1 = if drop 0 0 2 then 2 s" enumerate" argc= int? 0= if s" TypeError: enumerate() start must be an int" rt-fatal then
+   en-start ! iter>list new-list >r dup @ 0 begin 2dup > while 2 pick over l-at 2@ swap >r >r dup en-start @ + 0 list1 r> r> swap l-append1 7 r@ l-append 1+ repeat 2drop drop r> 3 ;
+: b-zip ( args n -- l 3 ) 2 s" zip" argc= iter>list >r iter>list r> ( la lb ) new-list >r over @ over @ min 0 begin 2dup > while
+   3 pick over l-at 2@ list1 3 pick 2 pick l-at 2@ l-append1 7 r@ l-append 1+ repeat 2drop 2drop r> 3 ;
+: b-any ( v t n -- f 5 ) 1 s" any" argc= iter>list dup @ 0 begin 2dup > while 2 pick over l-at 2@ rt-truthy if 2drop drop 1 5 exit then 1+ repeat 2drop drop 0 5 ;
+: b-all ( v t n -- f 5 ) 1 s" all" argc= iter>list dup @ 0 begin 2dup > while 2 pick over l-at 2@ rt-truthy 0= if 2drop drop 0 5 exit then 1+ repeat 2drop drop 1 5 ;
+\ stable bottom-up merge sort (in place), ordering by rt-cmp
+variable ms-l variable ms-aux variable ms-i variable ms-j variable ms-k variable ms-lo variable ms-mid variable ms-hi
+: ms-elem ( i -- a ) 16* ms-l @ l.items + ;
+: ms-take ( i -- ) ms-elem ms-k @ 16* ms-aux @ + 16 cmove 1 ms-k +! ;
+: ms-merge ( lo mid hi -- ) ms-hi ! ms-mid ! dup ms-lo ! ms-i ! ms-mid @ ms-j ! 0 ms-k !
+   begin ms-i @ ms-mid @ < ms-j @ ms-hi @ < and while
+      ms-j @ ms-elem 2@ ms-i @ ms-elem 2@ rt-cmp 0 < if ms-j @ ms-take 1 ms-j +! else ms-i @ ms-take 1 ms-i +! then repeat
+   begin ms-i @ ms-mid @ < while ms-i @ ms-take 1 ms-i +! repeat
+   begin ms-j @ ms-hi @ < while ms-j @ ms-take 1 ms-j +! repeat
+   ms-aux @ ms-lo @ ms-elem ms-k @ 16* cmove ;
+: l-sort ( l -- ) dup ms-l ! dup @ 16* 16 max alloc ms-aux ! @ 1 ( n w ) begin 2dup > while
+      0 begin dup 3 pick < while dup 2 pick + 3 pick min over 3 pick 2* + 4 pick min ( n w lo mid hi ) >r >r dup r> r> ms-merge over 2* + repeat drop
+      2* repeat 2drop ;
+: b-sorted ( args n -- l 3 ) 1 s" sorted" argc= iter>list dup l-sort 3 ;
+
+\ ------------------------------------------------------------------ I/O and process
+: read-line ( -- s ) 4096 sbuf >r begin key dup 0 >= over 10 <> and while put-char repeat drop r> sbuf> ;
+: b-input ( args n -- s 2 ) dup 1 = if drop v>str s>al type else 0 s" input" argc= then read-line 2 ;
+: b-exit ( args n -- v t ) dup 0= if drop 0 exit-code then 1 s" exit" argc= dup int? if drop exit-code then v>str s>al type cr 1 exit-code none ;
+
+\ ------------------------------------------------------------------ str methods   ( s 2 args... nargs -- v t )
+: str-method ( s t n -- s ) 0 s" str method" argc= 2 <> if s" AttributeError: str method called on a non-string" rt-fatal then ;   \ zero-arg str methods
+: s-map ( s xt -- s' ) >r dup @ sbuf swap s>al over + swap begin 2dup > while dup c@ r@ execute put-char 1+ repeat 2drop r> drop sbuf> ;
+: up-c ( c -- c ) dup [char] a [char] { within if 32 - then ;   : lo-c ( c -- c ) dup [char] A [char] [ within if 32 + then ;
+: m-upper ( s t n -- s 2 ) str-method ['] up-c s-map 2 ;   : m-lower ( s t n -- s 2 ) str-method ['] lo-c s-map 2 ;
+: strip-l ( addr len -- addr' len' ) begin dup 0 > 2 pick c@ s-strip-ws? and while 1- swap 1+ swap repeat ;
+: strip-r ( addr len -- addr len' ) begin dup 0 > 2 pick 2 pick + 1- c@ s-strip-ws? and while 1- repeat ;
+: m-strip ( s t n -- s 2 ) str-method s>al strip-l strip-r mkstr 2 ;
+: m-lstrip ( s t n -- s 2 ) str-method s>al strip-l mkstr 2 ;   : m-rstrip ( s t n -- s 2 ) str-method s>al strip-r mkstr 2 ;
+: split-ws ( s -- l ) new-list >r s>al over + swap begin 2dup > while
+      dup c@ s-strip-ws? if 1+ else dup begin 2 pick over > over c@ s-strip-ws? 0= and while 1+ repeat ( end start p ) over - 2dup mkstr 2 r@ l-append + then repeat 2drop r> ;
+: split-sep ( s sep -- l ) sb ! sa ! sb @ @ 0= if s" ValueError: empty separator" rt-fatal then new-list >r sa @ s>al over + swap ( end a ) begin
+      dup 2 pick over - mkstr sb @ s-find dup 0 < if drop 2dup swap over - mkstr 2 r@ l-append 2drop r> exit then
+      2dup mkstr 2 r@ l-append + sb @ @ + again ;
+: m-split ( s t args n -- l 3 ) dup 0= if drop drop split-ws 3 exit then 1 s" split" argc= 2 s" split" need-type nip split-sep 3 ;
+: m-join ( s t l tl n -- s 2 ) 1 s" join" argc= seq? 0= if s" TypeError: join() argument must be a list" rt-fatal then nip ( sep l )
+   0 jn-total ! dup @ 0 begin 2dup > while 2 pick over l-at dup 8 + @ 2 <> if s" TypeError: join() expects a list of strings" rt-fatal then @ @ jn-total +! 1+ repeat 2drop
+   over @ over @ 1- 0 max * jn-total @ + sbuf >r
+   dup @ 0 begin 2dup > while dup if 3 pick s>al put-al then 2 pick over l-at @ s>al put-al 1+ repeat 2drop 2drop r> sbuf> 2 ;
+: m-find ( s t sub ts n -- i 0 ) 1 s" find" argc= 2 s" find" need-type nip s-find 0 ;
+: m-index ( s t sub ts n -- i 0 ) m-find over 0 < if s" ValueError: substring not found" rt-fatal then ;
+: m-count-str ( s sub -- n ) sb ! sa ! 0 sa @ s>al over + swap ( n end a ) begin 2dup > while 2dup swap over - mkstr sb @ s-find dup 0 < if drop 2drop exit then + sb @ @ 1 max + rot 1+ -rot repeat 2drop ;
+: m-replace ( s t old to new tn n -- s 2 ) 2 s" replace" argc= 2 s" replace" need-type swap 2 s" replace" need-type rot drop ( s old new )
+   rp-new ! rp-old ! rp-old @ @ 0= if 2 exit then   \ (replacing the empty string is not supported: returns s unchanged)
+   dup @ rp-new @ @ 1 max * 64 + sbuf >r s>al over + swap ( end a ) begin 2dup > while
+      2dup swap over - mkstr rp-old @ s-find dup 0 < if drop 2dup swap over - put-al nip dup else
+      2dup put-al + rp-new @ s>al put-al rp-old @ @ + then repeat 2drop r> sbuf> 2 ;
+: s-starts ( s prefix -- f ) sb ! sa ! sb @ @ sa @ @ > if 0 exit then sa @ s.bytes sb @ @ mkstr sb @ s= ;
+: s-ends ( s suffix -- f ) sb ! sa ! sb @ @ sa @ @ > if 0 exit then sa @ dup @ sb @ @ - sb @ @ s-sub sb @ s= ;
+: m-startswith ( s t p tp n -- f 5 ) 1 s" startswith" argc= 2 s" startswith" need-type nip s-starts 5 ;
+: m-endswith ( s t p tp n -- f 5 ) 1 s" endswith" argc= 2 s" endswith" need-type nip s-ends 5 ;
+: s-all? ( s xt -- f ) >r dup @ 0= if r> 2drop 0 exit then s>al over + swap begin 2dup > while dup c@ r@ execute 0= if 2drop r> drop 0 exit then 1+ repeat 2drop r> drop 1 ;
+: m-isdigit ( s t n -- f 5 ) str-method ['] digit? s-all? 5 ;   : m-isalpha ( s t n -- f 5 ) str-method ['] alpha? s-all? 5 ;
+: m-isspace ( s t n -- f 5 ) str-method ['] s-strip-ws? s-all? 5 ;
+: m-isalnum ( s t n -- f 5 ) str-method ['] alnum? s-all? 5 ;
+: m-capitalize ( s t n -- s 2 ) str-method ['] lo-c s-map dup @ if dup s.bytes dup c@ up-c swap c! then 2 ;
+: m-title ( s t n -- s 2 ) str-method ['] lo-c s-map dup s>al over + swap 1 tt-flag ! begin 2dup > while
+      dup c@ alpha? if tt-flag @ if dup c@ up-c over c! then 0 tt-flag ! else 1 tt-flag ! then 1+ repeat 2drop 2 ;
+: m-zfill ( s t w tw n -- s 2 ) 1 s" zfill" argc= int? 0= if s" TypeError: zfill() needs an int" rt-fatal then nip over @ - 0 max ( s pad )
+   over @ over + sbuf >r over dup @ 0 > swap s.bytes c@ [char] - = and if [char] - put-char then dup 0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop
+   drop dup dup @ 0 > swap s.bytes c@ [char] - = and if s>al 1- swap 1+ swap put-al else s>al put-al then r> sbuf> 2 ;
+: m-center ( s t w tw n -- s 2 ) 1 s" center" argc= int? 0= if s" TypeError: center() needs an int" rt-fatal then nip over @ - 0 max ( s pad )
+   over @ over + sbuf >r dup 2/ swap over - ( s left right ) >r
+   0 begin 2dup > while 32 put-char 1+ repeat 2drop s>al put-al r> 0 begin 2dup > while 32 put-char 1+ repeat 2drop r> sbuf> 2 ;
+
+\ printf-style formatting and str.format / f-strings
+: fmt-fixed ( v t ndec -- s ) >r dup num? 0= if s" TypeError: format requires a number" rt-fatal then >f dup 0 < >r fabs r> swap r> fixed>str swap if s" -" mkstr swap s-concat then ;
+: fmt-exp ( v t ndec -- s ) >r >f dup 0 < >r fabs
+   dup 0.0 f= if drop 0 fd-E ! 1 fd-len ! [char] 0 FD-BUF c! else f-digits then
+   r> r> ( neg ndec ) 64 sbuf >r dup 1+ round-digits CD-BUF 1 put-al ?dup if [char] . put-char CD-BUF 1+ swap put-al then
+   [char] e put-char cd-dexp @ dup 0 < if [char] - put-char negate else [char] + put-char then dup 10 < if [char] 0 put-char then put-uint
+   r> sbuf> swap if s" -" mkstr swap s-concat then ;
+: has-dot? ( s -- f ) s>al over + swap begin 2dup > while dup c@ [char] . = if 2drop 1 exit then 1+ repeat 2drop 0 ;
+: strip-frac-zeros ( s -- s' )  \ "1.2300" -> "1.23", "5.000" -> "5"   (only when there is a '.' and no exponent)
+   dup has-dot? 0= if exit then dup s>al [char] e 0 2swap over + swap begin 2dup > while dup c@ [char] e = if 2drop 2drop exit then 1+ repeat 2drop 2drop
+   dup s>al over + 1- ( s a p ) begin dup c@ [char] 0 = while 1- repeat dup c@ [char] . = if 1- then over - 1+ mkstr nip ;
+: put-g-digits ( prec -- )  \ CD -> text per %g rules: strip trailing zeros, exponent form when exp < -4 or exp >= prec
+   begin cd-len @ 1 > CD-BUF cd-len @ + 1- c@ [char] 0 = and while -1 cd-len +! repeat
+   cd-dexp @ dup -4 < over 3 pick >= or if nip
+      CD-BUF 1 put-al cd-len @ 1 > if [char] . put-char CD-BUF 1+ cd-len @ 1- put-al then
+      [char] e put-char dup 0 < if [char] - put-char negate else [char] + put-char then dup 10 < if [char] 0 put-char then put-uint exit then
+   nip dup 0 < if s" 0." put-al negate 1- 0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop CD-BUF cd-len @ put-al exit then
+   1+ dup cd-len @ >= if CD-BUF cd-len @ put-al cd-len @ - 0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop exit then
+   CD-BUF over put-al [char] . put-char CD-BUF over + cd-len @ rot - put-al ;
+: fmt-g ( v t prec -- s ) 1 max >r >f dup 0 < >r fabs dup 0.0 f= if drop r> r> 2drop s" 0" mkstr exit then
+   f-digits r> r> swap >r dup round-digits 64 sbuf >r put-g-digits r> sbuf> r> if s" -" mkstr swap s-concat then ;
+: pad-left ( s width -- s' ) over @ - 0 max dup 0= if drop exit then over @ over + sbuf >r 0 begin 2dup > while 32 put-char 1+ repeat 2drop s>al put-al r> sbuf> ;
+: pad-right ( s width -- s' ) over @ - 0 max dup 0= if drop exit then over @ over + sbuf >r swap s>al put-al 0 begin 2dup > while 32 put-char 1+ repeat 2drop r> sbuf> ;
+: pad-zero ( s width -- s' ) over @ - 0 max dup 0= if drop exit then over @ over + sbuf >r over s.bytes c@ [char] - = if [char] - put-char then
+   0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop dup s.bytes c@ [char] - = if s>al 1- swap 1+ swap put-al else s>al put-al then r> sbuf> ;
+\ spec parser shared by % and format: [fill][align][sign][0][width][.prec][type]
+variable fs-isstr variable fs-align variable fs-width variable fs-prec variable fs-type variable fs-zero variable fs-plus variable fs-fill
+: parse-spec ( addr len -- ) over + ps-end ! ps-a ! 0 fs-align ! 0 fs-width ! -1 fs-prec ! 0 fs-type ! 0 fs-zero ! 0 fs-plus ! 32 fs-fill !
+   ps-a @ 1+ ps-end @ < if ps-a @ 1+ c@ dup [char] < = over [char] > = or over [char] ^ = or if fs-align ! ps-c fs-fill ! ps-adv ps-adv else drop then then
+   ps-c dup [char] < = over [char] > = or over [char] ^ = or if fs-align ! ps-adv else drop then
+   ps-c [char] + = if 1 fs-plus ! ps-adv then ps-c [char] - = if [char] < fs-align ! ps-adv then ps-c [char] 0 = if 1 fs-zero ! ps-adv then
+   begin ps-c digit? while fs-width @ 10 * ps-c [char] 0 - + fs-width ! ps-adv repeat
+   ps-c [char] , = if ps-adv then
+   ps-c [char] . = if ps-adv 0 fs-prec ! begin ps-c digit? while fs-prec @ 10 * ps-c [char] 0 - + fs-prec ! ps-adv repeat then
+   ps-c alpha? if ps-c fs-type ! ps-adv then ;
+: apply-spec ( v t -- s )  \ uses fs-* set by parse-spec
+   dup 2 = fs-isstr !
+   fs-type @ case
+      [char] f of fs-prec @ dup 0 < if drop 6 then fmt-fixed endof [char] F of fs-prec @ dup 0 < if drop 6 then fmt-fixed endof
+      [char] e of fs-prec @ dup 0 < if drop 6 then fmt-exp endof
+      [char] g of fs-prec @ dup 0 < if drop 6 then fmt-g endof
+      [char] d of dup int? 0= if s" ValueError: format code 'd' requires an integer" rt-fatal then v>str endof
+      [char] i of v>str endof [char] s of v>str endof [char] r of v>repr endof
+      [char] x of 1 b-hex drop s>al 2 - swap 2 + swap mkstr endof
+      drop dup 2 = if drop fs-prec @ 0 >= if dup @ fs-prec @ min 0 swap s-sub then else fs-prec @ 0 >= over 1 = and if fs-prec @ fmt-g else v>str then then 0 endcase
+   fs-plus @ if dup s.bytes c@ [char] - <> if s" +" mkstr swap s-concat then then
+   fs-width @ fs-align @ case [char] < of pad-right endof [char] > of pad-left endof
+      [char] ^ of over @ - 0 max dup 2/ swap over - ( s left right ) >r over @ + pad-left r> over @ + pad-right endof
+      drop fs-zero @ if pad-zero else fs-isstr @ if pad-right else pad-left then then 0 endcase ;
+: b-format1 ( v t spec ts n -- s 2 ) 2 s" __fmt" argc= drop s>al parse-spec apply-spec 2 ;
+variable fm-l variable fm-i variable fm-acc
+: fm-add ( addr len -- ) mkstr fm-acc @ swap s-concat fm-acc ! ;
+: spec-part ( addr len -- addr' len' ) begin dup 0 > 2 pick c@ [char] : <> and while 1- swap 1+ swap repeat dup 0 > if 1- swap 1+ swap then ;
+: fm-next-arg ( -- s ) fm-i @ fm-l @ @ >= if s" IndexError: not enough arguments for format string" rt-fatal then
+   fm-l @ fm-i @ l-at 2@ apply-spec 1 fm-i +! ;
+: m-format ( s t args... n -- s 2 )  \ "{}" and "{:spec}" are filled left to right ("{0}" style indexes are accepted but ignored)
+   new-list >r begin dup 0 > while 1- -rot r@ l-append repeat drop r> dup l-reverse! fm-l ! 0 fm-i !
+   2 <> if s" AttributeError: format() called on a non-string" rt-fatal then s" " mkstr fm-acc !
+   s>al over + swap ( end a ) begin 2dup > while
+      dup c@ [char] { = if 1+ dup c@ [char] { = if s" {" fm-add 1+ else
+         dup begin dup c@ [char] } <> over 4 pick < and while 1+ repeat ( end start p ) 2dup over - spec-part parse-spec
+         fm-next-arg s>al fm-add nip 1+ then else
+      dup c@ [char] } = if 1+ dup c@ [char] } = if 1+ then s" }" fm-add else
+      dup begin dup c@ [char] { <> over c@ [char] } <> and over 4 pick < and while 1+ repeat ( end start p ) over - 2dup fm-add + then then repeat 2drop fm-acc @ 2 ;
+\ "fmt" % value  or  "fmt" % (tuple)   — %d %i %s %r %f %e %g %x %% with flags, width and precision
+: rt-str% ( s v t -- s 2 ) dup 7 <> if list1 7 then drop fm-l ! 0 fm-i ! s" " mkstr fm-acc !
+   s>al over + swap ( end a ) begin 2dup > while
+      dup c@ [char] % = if 1+ dup c@ [char] % = if s" %" fm-add 1+ else
+         dup begin dup c@ alpha? 0= over 4 pick < and while 1+ repeat 1+ ( end start p ) 2dup over - parse-spec fm-next-arg s>al fm-add nip then
+      else dup begin dup c@ [char] % <> over 4 pick < and while 1+ repeat over - 2dup fm-add + then repeat 2drop
+   fm-i @ fm-l @ @ <> if s" TypeError: not all arguments converted during string formatting" rt-fatal then fm-acc @ 2 ;
+' rt-str% 'str% !
+
+\ ------------------------------------------------------------------ list methods   ( l 3 args... nargs -- v t )
+: need-list ( obj t -- obj ) 3 <> if s" AttributeError: list method called on a non-list (tuples are immutable)" rt-fatal then ;
+: m-append ( l t v tv n -- none ) 1 s" append" argc= 2swap need-list l-append none ;
+: m-extend ( l t v tv n -- none ) 1 s" extend" argc= iter>list -rot need-list swap dup @ 0 begin 2dup > while 2 pick over l-at 2@ 5 pick l-append 1+ repeat 2drop 2drop none ;
+: m-pop ( l t [i] n -- v t ) dup 0= if drop need-list dup @ 1- else 1 s" pop" argc= int? 0= if s" TypeError: pop index must be an int" rt-fatal then >r need-list r> over @ norm-index then
+   over @ 0= if s" IndexError: pop from empty list" rt-fatal then dup 2 pick @ u< 0= if index-error then 2dup l-at 2@ swap >r >r l-remove-at r> r> swap ;
+: m-insert ( l t i ti v tv n -- none ) 2 s" insert" argc= >r >r int? 0= if s" TypeError: insert index must be an int" rt-fatal then
+   >r need-list r> over @ clamp ( l i ) over dup @ over 8 + @ = if dup l-grow then drop
+   2dup l-at dup 16 + 3 pick @ 3 pick - 16* cmove-back ( l i ) over 1 swap +! l-at r> r> rot 2! none ;
+: m-remove ( l t v tv n -- none ) 1 s" remove" argc= 2swap need-list ( v tv l ) dup @ 0 begin 2dup > while
+      2 pick over l-at 2@ 6 pick 6 pick v= if nip l-remove-at 2drop none exit then 1+ repeat s" ValueError: list.remove(x): x not in list" rt-fatal ;
+: m-count ( obj t v tv n -- n 0 ) 1 s" count" argc= 2 pick 2 = if drop swap drop m-count-str 0 exit then rot drop rot ( v tv l ) 0 >r dup @ 0 begin 2dup > while
+      2 pick over l-at 2@ 6 pick 6 pick v= if r> 1+ >r then 1+ repeat 2drop drop 2drop r> 0 ;
+: m-index-any ( obj t v tv n -- i 0 ) dup 2* 1+ pick 2 = if m-index exit then 1 s" index" argc= rot drop rot dup @ 0 begin 2dup > while
+      2 pick over l-at 2@ 6 pick 6 pick v= if >r 2drop 2drop r> 0 exit then 1+ repeat s" ValueError: value is not in list" rt-fatal ;
+: m-reverse ( l t n -- none ) 0 s" reverse" argc= need-list l-reverse! none ;
+: m-sort ( l t n -- none ) 0 s" sort" argc= need-list l-sort none ;
+: m-copy ( obj t n -- v t ) 0 s" copy" argc= dup seq? if drop vcopy-list 3 exit then 6 <> if s" AttributeError: copy()" rt-fatal then
+   mkdict >r 0 begin 2dup d-next ?dup while dup 16 + 2@ r@ 3 pick 2@ d-set drop nip repeat 2drop drop r> 6 ;
+: m-clear ( obj t n -- none ) 0 s" clear" argc= dup 3 = if drop 0 swap ! none exit then 6 <> if s" AttributeError: clear()" rt-fatal then
+   dup 8 + @ dup 32 * alloc dup 3 pick 16 + ! swap slots-clear 0 over 32 + ! 0 swap ! none ;
+
+\ ------------------------------------------------------------------ dict methods   ( d 6 args... nargs -- v t )
+: need-dict ( d t -- d ) 6 <> if s" AttributeError: dict method called on a non-dict" rt-fatal then ;
+: m-keys ( d t n -- l 3 ) 0 s" keys" argc= need-dict d-keys 3 ;
+: m-values ( d t n -- l 3 ) 0 s" values" argc= need-dict new-list >r 0 begin 2dup d-next ?dup while 16 + 2@ r@ l-append nip repeat 2drop drop r> 3 ;
+: m-items ( d t n -- l 3 ) 0 s" items" argc= need-dict new-list >r 0 begin 2dup d-next ?dup while dup 16 + 2@ swap >r >r 2@ list1 r> r> swap l-append1 7 r@ l-append nip repeat 2drop drop r> 3 ;
+: m-get ( d t k tk [default] n -- v t ) dup 1 = if drop none 2 then 2 s" get" argc= >r >r >r >r need-dict r> r> d-get if r> r> 2drop else 2drop r> r> then ;
+variable sd-d variable sd-k variable sd-kt variable sd-v variable sd-vt
+: m-pop-any ( obj t args n -- v t ) dup 2* 1+ pick 3 = if m-pop exit then
+   dup 1 = if drop none 2 then 2 s" pop" argc= sd-vt ! sd-v ! sd-kt ! sd-k ! need-dict sd-d !
+   sd-d @ sd-k @ sd-kt @ d-get if sd-d @ sd-k @ sd-kt @ d-del drop exit then 2drop
+   sd-vt @ 4 = if sd-k @ sd-kt @ key-error then sd-v @ sd-vt @ ;
+: m-setdefault ( d t k tk [v tv] n -- v t ) dup 1 = if drop none 2 then 2 s" setdefault" argc= sd-vt ! sd-v ! sd-kt ! sd-k ! need-dict sd-d !
+   sd-d @ sd-k @ sd-kt @ d-get if exit then 2drop sd-v @ sd-vt @ sd-d @ sd-k @ sd-kt @ d-set sd-v @ sd-vt @ ;
+: m-update ( d t o to n -- none ) 1 s" update" argc= need-dict swap need-dict ( d o ) 0 begin 2dup d-next ?dup while dup 16 + 2@ 6 pick 3 pick 2@ d-set drop nip repeat 2drop 2drop none ;
+
+\ ------------------------------------------------------------------ math module
+: m-arg ( v t n -- f ) 1 s" math" argc= dup num? 0= if s" TypeError: must be a real number" rt-fatal then >f ;
+: domain-error s" ValueError: math domain error" rt-fatal ;
+: b-sqrt ( v t n -- f 1 ) m-arg dup 0.0 f< if domain-error then fsqrt 1 ;
+: b-sin m-arg fsin 1 ;   : b-cos m-arg fcos 1 ;   : b-tan m-arg ftan 1 ;
+: b-atan m-arg 1.0 fatan2 1 ;   : b-atan2 ( y ty x tx n -- f 1 ) 2 s" atan2" argc= >f >r >f r> fatan2 1 ;
+: b-asin m-arg dup fabs 1.0 f> if domain-error then dup dup f* 1.0 swap f- fsqrt fatan2 1 ;
+: b-acos m-arg dup fabs 1.0 f> if domain-error then dup dup f* 1.0 swap f- fsqrt swap fatan2 1 ;
+: b-log ( args n -- f 1 ) dup 2 = if drop >f >r >f dup 0.0 f<= if domain-error then fln r> fln f/ 1 exit then m-arg dup 0.0 f<= if domain-error then fln 1 ;
+: b-log10 m-arg dup 0.0 f<= if domain-error then fln 10.0 fln f/ 1 ;   : b-log2 m-arg dup 0.0 f<= if domain-error then fln 2.0 fln f/ 1 ;
+: b-exp m-arg fexp 1 ;
+: b-floor ( v t n -- n 0 ) 1 s" floor" argc= dup int? if drop 0 exit then >f floor f>s 0 ;
+: b-ceil ( v t n -- n 0 ) 1 s" ceil" argc= dup int? if drop 0 exit then >f fnegate floor fnegate f>s 0 ;
+: b-fabs m-arg fabs 1 ;
+: b-hypot ( args n -- f 1 ) 2 s" hypot" argc= >f >r >f dup f* r> dup f* f+ fsqrt 1 ;
+: b-degrees m-arg 180.0 f* 3.141592653589793 f/ 1 ;   : b-radians m-arg 3.141592653589793 f* 180.0 f/ 1 ;
+: b-isnan ( v t n -- f 5 ) m-arg fnan? 5 ;
+: b-isinf ( v t n -- f 5 ) m-arg fabs 1.0 0.0 f/ f= 5 ;
+: b-trunc ( v t n -- n 0 ) m-arg f>s 0 ;
+: b-gcd ( a ta b tb n -- n 0 ) 2 s" gcd" argc= int? 0= if s" TypeError: gcd() needs ints" rt-fatal then swap int? 0= if s" TypeError: gcd() needs ints" rt-fatal then
+   abs swap abs begin dup while tuck mod repeat drop 0 ;
+: b-factorial ( v t n -- n 0 ) 1 s" factorial" argc= int? 0= if s" TypeError: factorial() needs an int" rt-fatal then dup 0 < if s" ValueError: factorial() not defined for negative values" rt-fatal then
+   dup 20 > if s" OverflowError: factorial() result does not fit in 64 bits" rt-fatal then 1 swap begin dup 1 > while tuck * swap 1- repeat drop 0 ;
+
+\ ------------------------------------------------------------------ time and random modules
+: b-time ( n -- f 1 ) 0 s" time" argc= wall-ns s>f 1000000000.0 f/ 1 ;
+: b-perf ( n -- f 1 ) 0 s" perf_counter" argc= now-ns s>f 1000000000.0 f/ 1 ;
+: b-sleep ( v t n -- none ) 1 s" sleep" argc= >f now-ns swap 1000000000.0 f* f>s + begin now-ns over < while repeat drop none ;
+variable rng-s  88172645463325252 rng-s !      \ xorshift64 (NOT Python's Mersenne Twister: same seed gives different numbers)
+: rng-next ( -- u ) rng-s @ dup 13 lshift xor dup 7 rshift xor dup 17 lshift xor dup rng-s ! ;
+: b-random ( n -- f 1 ) 0 s" random" argc= rng-next 11 rshift s>f 9007199254740992.0 f/ 1 ;
+: b-seed ( args n -- none ) dup 0= if drop now-ns else 1 s" seed" argc= drop then dup 0= if 1+ then rng-s ! none ;
+: b-randint ( a ta b tb n -- n 0 ) 2 s" randint" argc= int? 0= if s" TypeError: randint() needs ints" rt-fatal then swap int? 0= if s" TypeError: randint() needs ints" rt-fatal then
+   2dup > if s" ValueError: empty range for randint()" rt-fatal then over - 1+ rng-next 1 rshift swap mod + 0 ;
+: b-choice ( v t n -- v t ) 1 s" choice" argc= dup seq? 0= if s" TypeError: choice() needs a list" rt-fatal then drop dup @ 0= if s" IndexError: cannot choose from an empty sequence" rt-fatal then
+   dup @ rng-next 1 rshift swap mod l-at 2@ ;
+: b-uniform ( a ta b tb n -- f 1 ) 2 s" uniform" argc= >f >r >f r> over f- 0 b-random drop f* f+ 1 ;
+: b-shuffle ( l t n -- none ) 1 s" shuffle" argc= need-list dup @ begin dup 1 > while 1- 2dup l-at 2@ swap >r >r rng-next 1 rshift 2 pick 1+ mod ( l i j ) 2 pick over l-at 2@ 4 pick 4 pick l-at 2! r> r> swap 4 pick 3 pick l-at 2! drop repeat 2drop none ;
+
+\ ------------------------------------------------------------------ registration
+' b-str s" str" builtin!   ' b-repr s" repr" builtin!   ' b-type s" type" builtin!   ' b-bool s" bool" builtin!
+' b-int s" int" builtin!   ' b-float s" float" builtin!   ' b-abs s" abs" builtin!   ' b-round s" round" builtin!
+' b-divmod s" divmod" builtin!   ' b-pow s" pow" builtin!   ' b-fpow s" __fpow" builtin!   ' b-min s" min" builtin!   ' b-max s" max" builtin!   ' b-sum s" sum" builtin!
+' b-ord s" ord" builtin!   ' b-chr s" chr" builtin!   ' b-hex s" hex" builtin!   ' b-len s" len" builtin!
+' b-list s" list" builtin!   ' b-tuple s" tuple" builtin!   ' b-range s" range" builtin!   ' b-reversed s" reversed" builtin!
+' b-enumerate s" enumerate" builtin!   ' b-zip s" zip" builtin!   ' b-any s" any" builtin!   ' b-all s" all" builtin!   ' b-sorted s" sorted" builtin!
+' b-input s" input" builtin!   ' b-exit s" exit" builtin!   ' b-exit s" quit" builtin!   ' b-format1 s" __fmt" builtin!
+' m-upper s" upper" method!   ' m-lower s" lower" method!   ' m-strip s" strip" method!   ' m-lstrip s" lstrip" method!   ' m-rstrip s" rstrip" method!
+' m-split s" split" method!   ' m-join s" join" method!   ' m-find s" find" method!   ' m-index-any s" index" method!   ' m-count s" count" method!
+' m-replace s" replace" method!   ' m-startswith s" startswith" method!   ' m-endswith s" endswith" method!
+' m-isdigit s" isdigit" method!   ' m-isalpha s" isalpha" method!   ' m-isspace s" isspace" method!   ' m-isalnum s" isalnum" method!
+' m-capitalize s" capitalize" method!   ' m-title s" title" method!   ' m-zfill s" zfill" method!   ' m-center s" center" method!   ' m-format s" format" method!
+' m-append s" append" method!   ' m-extend s" extend" method!   ' m-pop-any s" pop" method!   ' m-insert s" insert" method!   ' m-remove s" remove" method!
+' m-reverse s" reverse" method!   ' m-sort s" sort" method!   ' m-copy s" copy" method!   ' m-clear s" clear" method!
+' m-keys s" keys" method!   ' m-values s" values" method!   ' m-items s" items" method!   ' m-get s" get" method!   ' m-setdefault s" setdefault" method!   ' m-update s" update" method!
+s" math" module!  s" time" module!  s" random" module!  s" sys" module!
+' b-sqrt s" sqrt" builtin!   ' b-sin s" sin" builtin!   ' b-cos s" cos" builtin!   ' b-tan s" tan" builtin!   ' b-asin s" asin" builtin!   ' b-acos s" acos" builtin!
+' b-atan s" atan" builtin!   ' b-atan2 s" atan2" builtin!   ' b-log s" log" builtin!   ' b-log10 s" log10" builtin!   ' b-log2 s" log2" builtin!   ' b-exp s" exp" builtin!
+' b-floor s" floor" builtin!   ' b-ceil s" ceil" builtin!   ' b-fabs s" fabs" builtin!   ' b-hypot s" hypot" builtin!   ' b-degrees s" degrees" builtin!   ' b-radians s" radians" builtin!
+' b-isnan s" isnan" builtin!   ' b-isinf s" isinf" builtin!   ' b-trunc s" trunc" builtin!   ' b-gcd s" gcd" builtin!   ' b-factorial s" factorial" builtin!
+' b-time s" time" builtin!   ' b-perf s" perf_counter" builtin!   ' b-sleep s" sleep" builtin!
+' b-random s" random" builtin!   ' b-seed s" seed" builtin!   ' b-randint s" randint" builtin!   ' b-choice s" choice" builtin!   ' b-uniform s" uniform" builtin!   ' b-shuffle s" shuffle" builtin!
+\ module constants (global cells): math.pi math.e math.tau math.inf math.nan  sys.maxsize
+: const! ( v t addr len -- ) intern gcell stg ;
+3.141592653589793 1 s" pi" const!   2.718281828459045 1 s" e" const!   6.283185307179586 1 s" tau" const!
+1.0 0.0 f/ 1 s" inf" const!   0.0 0.0 f/ 1 s" nan" const!   9223372036854775807 0 s" maxsize" const!

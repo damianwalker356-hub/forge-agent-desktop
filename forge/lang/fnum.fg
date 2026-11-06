@@ -1,0 +1,127 @@
+\ fnum.fg — exact float <-> decimal conversion (bignum based), so Forge prints floats like CPython's repr
+\ (shortest digit string that round-trips) and parses float literals with correct rounding.
+\ bignum = NL little-endian 32-bit limbs, each stored in a 64-bit cell (so limb*k+carry fits in 64 bits).
+
+192 constant NL
+: bn-buf ( -- bn ) NL cells allocate ;
+bn-buf constant BNA   bn-buf constant BNB   bn-buf constant BN1
+variable bn-k variable bn-a variable bn-b
+: bn-clear ( bn -- ) NL cells 0 fill ;
+: bn-set ( u bn -- ) dup bn-clear over 4294967295 and over ! swap 32 rshift swap 8 + ! ;
+: bn-mul-small ( bn k -- ) bn-k ! dup NL cells + swap 0 ( end p carry )
+   begin over 3 pick < while over @ bn-k @ * + dup 4294967295 and 2 pick ! 32 rshift swap 8 + swap repeat drop 2drop ;
+: bn-add-small ( bn k -- ) swap dup NL cells + swap rot ( end p k )
+   begin dup while over @ + dup 4294967295 and 2 pick ! 32 rshift swap 8 + swap repeat drop 2drop ;
+: bn-divmod-small ( bn k -- rem ) bn-k ! dup NL cells + 0 ( bn end rem )
+   begin over 3 pick > while swap 8 - swap 32 lshift over @ + bn-k @ /mod 2 pick ! repeat nip nip ;
+: bn-zero? ( bn -- f ) dup NL cells + swap begin 2dup > while dup @ if 2drop 0 exit then 8 + repeat 2drop 1 ;
+: bn-cmp ( a b -- -1|0|1 ) bn-b ! bn-a ! NL begin dup 0 > while 1- dup cells bn-a @ + @ over cells bn-b @ + @
+   2dup <> if > if drop 1 else drop -1 then exit then 2drop repeat drop 0 ;
+: bn-mul-pow10 ( bn k -- ) begin dup 9 >= while over 1000000000 bn-mul-small 9 - repeat begin dup 0 > while over 10 bn-mul-small 1- repeat 2drop ;
+: bn-mul-pow2  ( bn k -- ) begin dup 28 >= while over 268435456 bn-mul-small 28 - repeat begin dup 0 > while over 2 bn-mul-small 1- repeat 2drop ;
+: bn-mul-pow5  ( bn k -- ) begin dup 13 >= while over 1220703125 bn-mul-small 13 - repeat begin dup 0 > while over 5 bn-mul-small 1- repeat 2drop ;
+: bn-from-digits ( addr len bn -- ) >r 0 r@ bn-set over + swap begin 2dup > while
+   r@ 10 bn-mul-small r@ over c@ [char] 0 - bn-add-small 1+ repeat 2drop r> drop ;
+: bn>digits ( bn buf -- len )  \ decimal digits, most significant first; returns count (>= 1)
+   >r dup bn-zero? if drop [char] 0 r> c! 1 exit then
+   r@ 1024 + begin over bn-zero? 0= while over 10 bn-divmod-small [char] 0 + swap 1- tuck c! repeat
+   nip r@ 1024 + over - ( p len ) over r@ 2 pick cmove nip r> drop ;
+
+\ ------------------------------------------------------------------ exact decimal expansion of a double
+1024 allocate constant FD-BUF   variable fd-len  variable fd-E     \ value = FD digits * 10^fd-E
+variable fx-m variable fx-e                                        \ x = fx-m * 2^fx-e  (m includes the hidden bit)
+: f-split ( f -- ) dup 52 rshift 2047 and swap 4503599627370495 and ( exp frac )
+   over 0= if fx-m ! drop -1074 fx-e ! exit then 4503599627370496 or fx-m ! 1075 - fx-e ! ;
+: f-digits ( f -- )  \ f >= 0, finite.  fills FD-BUF / fd-len / fd-E exactly
+   f-split fx-m @ BN1 bn-set
+   fx-e @ 0 >= if BN1 fx-e @ bn-mul-pow2 0 fd-E ! else BN1 fx-e @ negate bn-mul-pow5 fx-e @ fd-E ! then
+   BN1 FD-BUF bn>digits fd-len ! ;
+: fd-dexp ( -- n ) fd-len @ 1- fd-E @ + ;        \ decimal exponent of the leading digit
+
+\ ------------------------------------------------------------------ rounding the exact digits to n significant digits
+64 allocate constant CD-BUF  variable cd-len variable cd-dexp     \ candidate: cd-len digits, leading digit exponent cd-dexp
+: cd-round-up ( -- )  \ add one unit in the last place of the candidate (with carry)
+   cd-len @ 1- begin dup 0 >= while dup CD-BUF + c@ [char] 9 = if [char] 0 over CD-BUF + c! 1- else
+      dup CD-BUF + dup c@ 1+ swap c! drop exit then repeat drop
+   [char] 1 CD-BUF c! 1 cd-dexp +! ;   \ all nines: 999 -> 1000 (same length, exponent + 1)
+: rest-nonzero? ( from -- f ) begin dup fd-len @ < while dup FD-BUF + c@ [char] 0 <> if drop 1 exit then 1+ repeat drop 0 ;
+: round-digits ( n -- )  \ CD := FD rounded half-even to n significant digits (n >= 1)
+   fd-dexp cd-dexp ! dup cd-len !
+   dup fd-len @ >= if FD-BUF CD-BUF fd-len @ cmove CD-BUF fd-len @ + over fd-len @ - [char] 0 fill drop exit then
+   FD-BUF CD-BUF 2 pick cmove ( n )
+   dup FD-BUF + c@ ( n d ) dup [char] 5 > if 2drop cd-round-up exit then [char] 5 < if drop exit then
+   dup 1+ rest-nonzero? if drop cd-round-up exit then
+   1- CD-BUF + c@ 1 and if cd-round-up then ;
+
+\ ------------------------------------------------------------------ does the candidate round-trip to x?
+\ compare C*10^F  with  h*2^g   ( C = candidate digits )
+: cmp-scaled ( h g F -- -1|0|1 )  \ sign of (C*10^F - h*2^g)
+   CD-BUF cd-len @ BNA bn-from-digits rot BNB bn-set ( g F )
+   dup 0 >= if BNA swap bn-mul-pow10 else BNB swap negate bn-mul-pow10 then
+   dup 0 >= if BNB swap bn-mul-pow2 else BNA swap negate bn-mul-pow2 then
+   BNA BNB bn-cmp ;
+: cand-F ( -- F ) cd-dexp @ cd-len @ 1- - ;
+: cand-ok? ( -- f )  \ candidate lies strictly inside the rounding interval of x (ties allowed when m is even)
+   fx-m @ 2* 1+ fx-e @ 1- cand-F cmp-scaled ( hi ) dup 0 > if drop 0 exit then
+   0= fx-m @ 1 and and if 0 exit then
+   fx-m @ 4503599627370496 = fx-e @ -1074 > and
+   if fx-m @ 4 * 1- fx-e @ 2 - else fx-m @ 2* 1- fx-e @ 1- then cand-F cmp-scaled ( lo )
+   dup 0 < if drop 0 exit then 0= fx-m @ 1 and and if 0 exit then 1 ;
+: shortest-digits ( f -- )  \ f > 0 finite: CD := shortest round-tripping digits
+   f-digits 1 begin dup 17 < while dup round-digits cand-ok? if drop exit then 1+ repeat round-digits ;
+
+\ ------------------------------------------------------------------ formatting like CPython repr()
+: put-repr-digits ( -- )  \ CD -> text per repr rules
+   cd-dexp @ dup -4 >= over 16 < and if
+      dup 0 < if s" 0." put-al negate 1- 0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop CD-BUF cd-len @ put-al exit then
+      1+ ( intdigits ) dup cd-len @ >= if CD-BUF cd-len @ put-al cd-len @ - 0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop s" .0" put-al exit then
+      CD-BUF over put-al [char] . put-char CD-BUF over + cd-len @ rot - put-al exit then
+   CD-BUF 1 put-al cd-len @ 1 > if [char] . put-char CD-BUF 1+ cd-len @ 1- put-al then
+   [char] e put-char dup 0 < if [char] - put-char negate else [char] + put-char then dup 10 < if [char] 0 put-char then put-uint ;
+: put-float-exact ( f -- )
+   dup fnan? if drop s" nan" put-al exit then
+   dup 0 < if [char] - put-char fnegate then
+   dup 1.0 0.0 f/ f= if drop s" inf" put-al exit then
+   dup 0.0 f= if drop s" 0.0" put-al exit then
+   shortest-digits put-repr-digits ;
+' put-float-exact 'put-float !
+: put-zeros ( n -- ) 0 max 0 begin 2dup > while [char] 0 put-char 1+ repeat 2drop ;
+: put-fixed-n ( f ndec -- )  \ |f| with exactly ndec decimals, exact round-half-even (like '%.Nf')
+   swap dup fnan? if 2drop s" nan" put-al exit then dup 1.0 0.0 f/ f= if 2drop s" inf" put-al exit then
+   dup 0.0 f= if drop 0 fd-E ! 1 fd-len ! [char] 0 FD-BUF c! else f-digits then
+   ( ndec ) fd-dexp over + 1+ ( ndec nsig )
+   dup 0 <= if 0= if FD-BUF c@ dup [char] 5 > swap [char] 5 = 1 rest-nonzero? and or else 0 then ( ndec up )
+      over 0= if if s" 1" else s" 0" then put-al drop exit then
+      s" 0." put-al swap 1- put-zeros if [char] 1 else [char] 0 then put-char exit then
+   round-digits ( ndec ) cd-dexp @ 1+ ( ndec intd )
+   dup 0 <= if [char] 0 put-char [char] . put-char negate dup put-zeros CD-BUF cd-len @ put-al cd-len @ + - put-zeros exit then
+   dup cd-len @ min CD-BUF swap put-al dup cd-len @ - put-zeros ( ndec intd )
+   over 0= if 2drop exit then [char] . put-char
+   cd-len @ over - 0 max ( ndec intd nfrac ) dup if CD-BUF 2 pick + over put-al then nip - put-zeros ;
+: fixed>str ( f ndec -- s ) 1100 sbuf -rot put-fixed-n sbuf> ;
+
+\ ------------------------------------------------------------------ correctly rounded decimal -> double
+\ value = digits(addr,len) * 10^E10 ; digits may have leading zeros
+variable pd-addr variable pd-len variable pd-E
+: pd-side ( h g -- n )  \ sign of ( D*10^E10 - h*2^g ) with D = pd digits
+   pd-addr @ pd-len @ BNA bn-from-digits swap BNB bn-set ( g ) pd-E @
+   dup 0 >= if BNA swap bn-mul-pow10 else BNB swap negate bn-mul-pow10 then
+   dup 0 >= if BNB swap bn-mul-pow2 else BNA swap negate bn-mul-pow2 then BNA BNB bn-cmp ;
+: f-approx ( -- f )  \ first 19 digits as integer, scaled (may be off by a few ulps)
+   0 pd-addr @ pd-len @ 19 min over + swap begin 2dup > while rot 10 * over c@ [char] 0 - + -rot 1+ repeat 2drop s>f
+   pd-E @ pd-len @ 19 - 0 max + dup 0= if drop exit then
+   dup -300 < if >r 300 10^ f/ r> 300 + then dup 300 > if >r 300 10^ f* r> 300 - then
+   dup 0 < if negate 10^ f/ else 10^ f* then ;
+: decimal>f ( addr len E10 -- f ) pd-E ! pd-len ! pd-addr !
+   begin pd-len @ 1 > pd-addr @ c@ [char] 0 = and while 1 pd-addr +! -1 pd-len +! repeat   \ strip leading zeros
+   pd-len @ 1 = pd-addr @ c@ [char] 0 = and if 0.0 exit then
+   pd-len @ 800 > if pd-len @ 800 - pd-E +! 800 pd-len ! then
+   f-approx dup 1.0 0.0 f/ f= if drop 9218868437227405311 then   \ overflowed: start from DBL_MAX and let the loop decide
+   begin
+      dup f-split
+      fx-m @ 2* 1+ fx-e @ 1- pd-side ( f hi ) dup 0 > over 0= fx-m @ 1 and and or if drop 1+ ( next double up ) else drop
+      fx-m @ 0= if exit then
+      fx-m @ 4503599627370496 = fx-e @ -1074 > and if fx-m @ 4 * 1- fx-e @ 2 - else fx-m @ 2* 1- fx-e @ 1- then pd-side ( f lo )
+      dup 0 < over 0= fx-m @ 1 and and or if drop 1- else drop exit then then
+      dup 9218868437227405312 >= if exit then   \ reached +inf
+   again ;

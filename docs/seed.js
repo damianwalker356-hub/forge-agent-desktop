@@ -1,0 +1,12 @@
+export const SEED = {
+  decisions: [
+    { key: "forge-agent separate from Engine Forge", value: "standalone project", reason: "inject into Engine Forge only when the user says so" },
+    { key: "workflow", value: "multi-run with proceed checkpoints", reason: "user preference" },
+  ],
+  preferences: { style: "direct, factual, correct over reassuring", deployment: "GitHub Pages for Engine Forge" },
+  openItems: [
+    { id: "P1", title: "Fix 3D pipe smoothness and connections" },
+    { id: "P2", title: "Improve 3D model quality" },
+    { id: "P3", title: "Completeness check: every part present and correctly connected" },
+  ],
+};

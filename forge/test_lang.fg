@@ -1,0 +1,55 @@
+\ test_lang.fg — kernel-level features added in Forge 1.0 (run after core.fg: ./forge core.fg test_lang.fg)
+: check ( got expected -- ) 2dup = if 2drop ." ok   " else ." FAIL " swap (.) ."  expected " (.) cr abort then ;
+: fcheck ( got expected -- ) 2dup f- fabs 0.000001 f< if 2drop ." ok   " else ." FAIL " swap f. ."  expected " f. cr abort then ;
+
+\ floats: literals, arithmetic, compares, conversion, transcendentals
+1.5 2.25 f+ 3.75 fcheck     10.0 4.0 f/ 2.5 fcheck     -1.5 fabs 1.5 fcheck
+2.0 fsqrt fsquare 2.0 fcheck    .5 2.0 f* 1.0 fcheck
+1.0 2.0 f< 1 check   2.0 1.0 f< 0 check   3.0 3.0 f= 1 check   2.0 1.0 f> 1 check
+7 s>f 7.0 fcheck    7.9 f>s 7 check    -7.9 f>s -7 check    2.5 fround 2 check   3.5 fround 4 check
+pi fsin 0.0 fcheck   0.0 fcos 1.0 fcheck   1.0 fexp fln 1.0 fcheck   1.0 1.0 fatan2 pi 4.0 f/ fcheck
+2.0 10.0 f** 1024.0 fcheck    -2.5 floor -3.0 fcheck
+\ loops: do/loop, +loop, i, j, nested
+: t1 0 10 0 do i + loop ; t1 45 check
+: t2 0 20 0 do i + 5 +loop ; t2 30 check
+: t3 0 3 0 do 3 0 do j 10 * i + + loop loop ; t3 99 check
+\ control flow: begin/until, begin/while/repeat, if/else, exit, recursion
+: t4 0 begin 1+ dup 7 = until ; t4 7 check
+: t5 0 begin dup 5 < while 1+ repeat ; t5 5 check
+: fact dup 1 > if dup 1- recurse * else drop 1 then ; 10 fact 3628800 check
+: t6 dup 3 > if drop 1 exit then drop 0 ; 5 t6 1 check 2 t6 0 check
+\ bit/arith primitives
+6 3 and 2 check   6 3 or 7 check   6 3 xor 5 check   1 10 lshift 1024 check   1024 3 rshift 128 check
+0 invert -1 check   5 negate -5 check   -1 1 u< 0 check   17 5 mod 2 check
+\ memory: variables, allocate, cmove, c@ c!, fill
+variable v  12 v !  v @ 12 check   5 v +!  v @ 17 check
+1000000 allocate constant big   big 0 <> 1 check   big 999999 + c@ 0 check   77 big 999999 + c!  big 999999 + c@ 77 check
+big 100 65 fill  big 99 + c@ 65 check   big big 200 + 100 cmove  big 250 + c@ 65 check
+\ strings
+s" hello" nip 5 check   s" abc" s" abc" str= 1 check   s" abc" s" abd" str= 0 check
+z" zero" zlen 4 check
+\ compile-time words: ' ['] execute literal postpone create constant array
+' t1 execute 45 check   : t7 ['] t1 execute ; t7 45 check
+: t8 [ 6 7 * ] literal ; t8 42 check
+99 constant k99  k99 99 check    4 array arr  5 arr 2 cells + !  arr 2 cells + @ 5 check
+: mk-double : postpone dup postpone + postpone ; ;   mk-double dbl   21 dbl 42 check
+: mk-const >r : r> postpone literal postpone ; ;    7 mk-const seven   seven 7 check
+: tq  0 postpone literal postpone do ; immediate compile-only   : tend postpone loop ; immediate compile-only
+: t9 0 4 tq i + tend ; t9 6 check
+state@ 0 check   : t10 state@ ; t10 0 check
+\ return stack, pick, depth
+: t11 1 2 >r 3 r> + + ; t11 6 check   1 2 3 depth 3 check 2drop drop
+\ case/of
+: cs case 1 of 10 endof 2 of 20 endof drop 0 0 endcase ; 1 cs 10 check 2 cs 20 check 3 cs 0 check
+\ files: write, read back, delete
+z" /tmp/forge_test.txt" create-file dup 0 > 1 check
+dup s" forge file test" write-file 15 check  close-file
+z" /tmp/forge_test.txt" O_RDONLY 0 open-file dup 0 > 1 check
+dup big 100 read-file 15 check  close-file   big 15 s" forge file test" str= 1 check
+z" /tmp/forge_test.txt" 0 0 0 0 0 87 syscall 0 check     \ unlink(2) via raw syscall
+\ syscall: getpid > 0
+0 0 0 0 0 0 39 syscall 0 > 1 check
+\ interpreter: argc/argv
+argc 3 check   1 argv zlen 7 check
+." all language tests passed" cr
+bye

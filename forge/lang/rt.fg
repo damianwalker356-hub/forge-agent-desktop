@@ -1,0 +1,367 @@
+\ rt.fg — runtime for Forge's Python-like layer, written in Forge RPN on the 1.0 kernel.
+\ A value is two cells on the data stack: ( payload tag ).  Tags:
+\   0 int  1 float  2 str  3 list  4 none  5 bool  6 dict  255 unbound
+\ str  = ptr -> [len 8][bytes]              (immutable, shared)
+\ list = ptr -> [len 8][cap 8][items 8]     items: 16-byte values
+\ dict = ptr -> [count 8][cap 8][slots 8]   slots: 32 bytes (kv kt vv vt); kt 255 = empty; cap power of 2
+
+: 0<> ( n -- f ) 0 <> ;
+: 2@ ( a -- lo hi ) dup @ swap 8 + @ ;
+: 2! ( lo hi a -- ) swap over 8 + ! ! ;
+: 16* 4 lshift ;
+: mem= ( a b n -- f ) begin dup 0 > while 1- >r over c@ over c@ <> if r> drop 2drop 0 exit then 1+ swap 1+ swap r> repeat drop 2drop 1 ;
+
+\ ------------------------------------------------------------------ errors (stderr, exit code 1)
+variable cur-line  0 cur-line !
+: err-type ( addr len -- ) 2 -rot write-file drop ;
+: err-char ( c -- ) sp@ 2 swap 1 write-file drop drop ;
+: err-uint ( u -- ) dup 10 < if [char] 0 + err-char exit then 10 /mod recurse [char] 0 + err-char ;
+: err-int  ( n -- ) dup 0 < if [char] - err-char negate then err-uint ;
+: rt-fatal ( addr len -- ) err-type s"  (line " err-type cur-line @ err-int s" )" err-type 10 err-char 1 exit-code ;
+
+\ ------------------------------------------------------------------ memory: bump arena over mmap chunks
+variable arena-ptr   variable arena-end   0 arena-ptr !  0 arena-end !
+: arena-grow ( n -- ) 67108864 max dup allocate dup 0 < if s" MemoryError: mmap failed" rt-fatal then
+   dup arena-ptr ! + arena-end ! ;
+: alloc ( n -- addr ) 7 + -8 and  dup arena-ptr @ + arena-end @ > if dup arena-grow then
+   arena-ptr @ swap over + arena-ptr ! ;
+: alloc0 ( n -- addr ) dup alloc swap over swap 0 fill ;
+
+\ ------------------------------------------------------------------ constants and type tests
+: none  ( -- v t ) 0 4 ;
+: true  ( -- v t ) 1 5 ;
+: false ( -- v t ) 0 5 ;
+: int?  ( t -- f ) dup 0= swap 5 = or ;
+: num?  ( t -- f ) dup int? swap 1 = or ;
+: seq?  ( t -- f ) dup 3 = swap 7 = or ;    \ list or tuple (same memory layout; tag 7 = tuple, immutable)
+: >f    ( v t -- f ) 1 = if exit then s>f ;
+: fnan? ( f -- flag ) 9223372036854775807 and 9218868437227405312 > ;   \ the kernel's f= treats NaN = NaN, so test the bits
+
+\ ------------------------------------------------------------------ strings
+: mkstr   ( addr len -- s ) dup 8 + alloc dup >r 2dup ! 8 + swap cmove r> ;
+: s.len   ( s -- n ) @ ;
+: s.bytes ( s -- a ) 8 + ;
+: s>al    ( s -- addr len ) dup 8 + swap @ ;
+variable sa variable sb
+: s-concat ( s1 s2 -- s ) sb ! sa !  sa @ @ sb @ @ + dup 8 + alloc >r r@ !
+   sa @ s>al r@ 8 + swap cmove   sb @ s>al r@ 8 + sa @ @ + swap cmove  r> ;
+: s= ( s1 s2 -- f ) 2dup = if 2drop 1 exit then  sb ! sa !  sa @ @ sb @ @ <> if 0 exit then
+   sa @ s.bytes sb @ s.bytes sa @ @ mem= ;
+: s-cmp ( s1 s2 -- -1|0|1 ) sb ! sa !  sa @ @ sb @ @ min 0
+   begin 2dup > while ( n i ) sa @ s.bytes over + c@ sb @ s.bytes 2 pick + c@ ( n i ca cb )
+      2dup <> if > if 2drop 1 else 2drop -1 then exit then 2drop 1+ repeat
+   2drop sa @ @ sb @ @ 2dup = if 2drop 0 else < if -1 else 1 then then ;
+: s-sub  ( s i n -- s' ) >r s.bytes + r> mkstr ;
+: s-find ( hay needle -- idx|-1 ) sb ! sa !  sa @ @ sb @ @ - dup 0 < if drop -1 exit then 1+ 0
+   begin 2dup > while ( limit i ) sa @ s.bytes over + sb @ s.bytes sb @ @ mem= if nip exit then 1+ repeat 2drop -1 ;
+: s-char ( s i -- s' ) s.bytes + 1 mkstr ;
+: s-repeat ( s n -- s' ) 0 max sa !  dup @ sa @ * dup 8 + alloc >r r@ !  ( s )
+   sa @ 0 begin 2dup > while ( s n i ) 2 pick s>al ( s n i a l ) r@ 8 + 3 pick 6 pick @ * + swap cmove 1+ repeat 2drop drop r> ;
+
+\ ------------------------------------------------------------------ lists
+: mklist  ( cap -- l ) 1 max 24 alloc >r 0 r@ ! dup r@ 8 + ! 16* alloc r@ 16 + ! r> ;
+: l.len   ( l -- n ) @ ;
+: l.items ( l -- a ) 16 + @ ;
+: l-grow  ( l -- ) dup 8 + @ 2* dup 16* alloc ( l cap' items' ) 2 pick l.items over 4 pick @ 16* cmove
+   ( l cap' items' ) 2 pick 16 + ! swap 8 + ! ;
+: l-append ( v t l -- ) dup @ over 8 + @ = if dup l-grow then ( v t l ) dup @ 16* over l.items + >r 1 swap +! r> 2! ;
+: l-at   ( l i -- a ) 16* swap l.items + ;
+: l-concat ( l1 l2 -- l ) sb ! sa !  sa @ @ sb @ @ + mklist >r
+   sa @ l.items r@ l.items sa @ @ 16* cmove   sb @ l.items r@ l.items sa @ @ 16* + sb @ @ 16* cmove
+   sa @ @ sb @ @ + r@ ! r> ;
+: l-copy ( l i n -- l' ) sa ! l-at sa @ mklist dup >r l.items sa @ 16* cmove sa @ r@ ! r> ;
+: l-repeat ( l n -- l' ) 0 max sa !  dup @ sa @ * mklist >r ( l )
+   sa @ 0 begin 2dup > while ( l n i ) 2 pick l.items r@ l.items 2 pick 5 pick @ * 16* + 4 pick @ 16* cmove 1+ repeat 2drop
+   dup @ sa @ * r@ ! drop r> ;
+
+\ ------------------------------------------------------------------ dicts (open addressing, linear probe, tombstones)
+variable dk-v  variable dk-t  variable dd  variable dk-tomb
+: s-hash ( s -- h ) 0xcbf29ce484222325 swap s>al over + swap ( h end a ) begin 2dup > while
+   dup c@ >r rot r> xor 0x100000001b3 * -rot 1+ repeat 2drop ;
+variable 'key-hash variable 'l=
+: t-hash ( l -- h ) dup @ 0 0xcbf29ce484222325 ( l n i h ) begin 2 pick 2 pick > while 3 pick 2 pick l-at 2@ 'key-hash @ execute xor 0x100000001b3 * swap 1+ swap repeat nip nip nip ;
+: key-hash ( v t -- h ) dup 2 = if drop s-hash exit then dup 7 = if drop t-hash exit then
+   1 = if dup dup f>s s>f f= if f>s then then ;            \ integral floats hash like the int (1 == 1.0)
+: key= ( v1 t1 v2 t2 -- f )  \ Python key equality: numbers by value (int/bool/float), strings by content
+   dup 2 = 3 pick 2 = or if dup 2 = 3 pick 2 = and if drop nip s= else 2drop 2drop 0 then exit then
+   dup 4 = 3 pick 4 = or if nip = nip exit then
+   dup 7 = 3 pick 7 = or if dup 7 = 3 pick 7 = and if drop nip 'l= @ execute else 2drop 2drop 0 then exit then
+   dup 1 = 3 pick 1 = or if >f -rot >f f= exit then
+   drop nip = ;
+' key-hash 'key-hash !
+: slots-clear ( a n -- ) 0 begin 2dup > while 2 pick over 32 * + 255 swap 8 + ! 1+ repeat 2drop drop ;
+: mkdict ( -- d ) 40 alloc >r 0 r@ ! 8 r@ 8 + ! 8 32 * alloc dup r@ 16 + ! 8 slots-clear 8 8 * alloc r@ 24 + ! 0 r@ 32 + ! r> ;
+: d.cap ( d -- n ) 8 + @ ;
+: d.slots ( d -- a ) 16 + @ ;
+\ dict layout: +0 count, +8 cap, +16 slots (32 bytes each: kv kt vv vt; kt 255 = empty, 254 = tombstone), +24 insertion-order array of slot indexes, +32 its length
+: d-order-add ( slot -- ) dd @ d.slots - 32 / dd @ 24 + @ dd @ 32 + @ 8 * + ! 1 dd @ 32 + +! ;
+: d-order-del ( slot -- ) dd @ d.slots - 32 / dd @ 24 + @ dd @ 32 + @ 8 * over + swap ( idx end p ) begin dup @ 3 pick <> while 8 + repeat
+   dup 8 + swap 2 pick over - 8 - cmove drop drop -1 dd @ 32 + +! ;
+: d-probe ( d kv kt -- slot found )   \ found=1: key present. found=0: slot where it would be inserted
+   dk-t ! dk-v ! dd !  0 dk-tomb !
+   dk-v @ dk-t @ key-hash dd @ d.cap 1- and
+   begin dup 32 * dd @ d.slots + dup 8 + @ ( i slot kt )
+      dup 255 = if drop nip dk-tomb @ ?dup if nip then 0 exit then
+      254 = if dk-tomb @ 0= if dup dk-tomb ! then drop
+      else dup 2@ dk-v @ dk-t @ key= if nip 1 exit then drop then
+      1+ dd @ d.cap 1- and
+   0 until ;
+: d-get ( d kv kt -- vv vt found ) d-probe if 16 + 2@ 1 else drop 0 0 0 then ;
+variable dg-d variable dg-old variable dg-cap variable dg-oldord variable dg-n
+: d-grow ( d -- ) dup dg-d ! dup d.cap dg-cap ! dup d.slots dg-old ! 24 + @ dg-oldord !
+   dg-cap @ 2* dg-d @ 8 + !   dg-cap @ 2* 32 * alloc dg-d @ 16 + !   dg-d @ d.slots dg-cap @ 2* slots-clear
+   dg-cap @ 2* 8 * alloc dg-d @ 24 + !  dg-d @ 32 + @ dg-n !  0 dg-d @ 32 + !  0 dg-d @ !
+   dg-n @ 0 begin 2dup > while dup 8 * dg-oldord @ + @ 32 * dg-old @ + ( n i slot )
+      dup 16 + 2@ rot ( n i vv vt slot ) dg-d @ over 2@ d-probe drop nip ( n i vv vt slot' )
+      dup d-order-add dk-v @ dk-t @ 2 pick 2! 16 + 2! 1 dg-d @ +! 1+ repeat 2drop ;
+: d-set ( vv vt d kv kt -- )
+   d-probe if 16 + 2! exit then                                   ( vv vt slot )
+   dup 8 + @ 255 = if dd @ @ 1+ 3 * dd @ d.cap 2* > if
+      drop dk-v @ >r dk-t @ >r dd @ dup >r d-grow r> r> r> swap d-probe drop then then
+   dup d-order-add dk-v @ dk-t @ 2 pick 2! 16 + 2! 1 dd @ +! ;
+: d-del ( d kv kt -- found ) d-probe if dup d-order-del 254 swap 8 + ! -1 dd @ +! 1 else drop 0 then ;
+: d-count ( d -- n ) @ ;
+\ iterate in insertion order: d-next ( d i -- i' slot|0 )  i indexes the order array
+: d-next ( d i -- i' slot ) 2dup swap 32 + @ < if 2dup swap 24 + @ swap 8 * + @ 32 * rot d.slots + swap 1+ swap else 2drop 0 0 then ;
+
+\ ------------------------------------------------------------------ string building and number formatting
+variable nbp
+: sbuf  ( max -- start ) 8 + alloc dup 8 + nbp ! ;
+: sbuf> ( start -- s ) nbp @ over 8 + - over ! ;
+: put-char ( c -- ) nbp @ c! 1 nbp +! ;
+: put-al ( addr len -- ) nbp @ swap dup nbp +! cmove ;
+: put-uint ( u -- ) dup 10 < if [char] 0 + put-char exit then 10 /mod recurse [char] 0 + put-char ;
+: put-int  ( n -- ) dup 0 < if [char] - put-char negate then put-uint ;
+: int>str  ( n -- s ) 24 sbuf swap put-int sbuf> ;
+: ndig ( u -- n ) 1 swap begin 10 / dup 0 > while swap 1+ swap repeat drop ;
+: 10^ ( n -- f ) dup 0 < if negate recurse 1.0 swap f/ exit then dup 22 <= if 1.0 swap begin dup 0 > while swap 10.0 f* swap 1- repeat drop exit then
+   1.0 10.0 rot begin dup 0 > while dup 1 and if >r swap over f* swap r> then >r fdup f* r> 1 rshift repeat drop fdrop ;
+: put-digits ( u n -- )  \ u as exactly n digits, zero padded
+   nbp @ over + dup nbp ! -rot ( p u n ) begin dup 0 > while 1- rot 1- rot 10 /mod >r [char] 0 + over c! r> rot repeat 2drop drop ;
+: put-fixed ( f -- )  \ 0 <= f < 1e16: 15 significant digits, trailing zeros stripped, at least one decimal digit
+   dup f>s ndig 15 swap - 0 max >r  r@ 10^ f* fround ( m )  r@ 10^ f>s /mod ( frac int ) put-uint [char] . put-char
+   r> ( frac k ) begin dup 1 > 2 pick 10 mod 0= and while swap 10 / swap 1- repeat put-digits ;
+variable 'put-float
+: put-float ( f -- ) 'put-float @ execute ;
+: put-float-approx ( f -- )
+   dup fnan? if drop s" nan" put-al exit then
+   dup 0 < if [char] - put-char fnegate then
+   dup 1.0 0.0 f/ f= if drop s" inf" put-al exit then
+   dup 0.0 f= if drop s" 0.0" put-al exit then
+   dup 10000000000000000.0 f< over 0.0001 f>= and if put-fixed exit then
+   dup 290 negate 10^ f< if 300 10^ f* -300 else 0 then >r
+   dup fln 10.0 fln f/ floor f>s ( f e ) 2dup 10^ f/ ( f e m ) swap r> + swap dup 10.0 f>= if 10.0 f/ swap 1+ swap then dup 1.0 f< if 10.0 f* swap 1- swap then
+   put-fixed nbp @ 1- c@ [char] 0 = if nbp @ 2 - c@ [char] . = if -2 nbp +! then then nip
+   [char] e put-char dup 0 < if [char] - put-char negate else [char] + put-char then dup 10 < if [char] 0 put-char then put-uint ;
+' put-float-approx 'put-float !
+: float>str ( f -- s ) 1100 sbuf swap put-float sbuf> ;
+
+\ ------------------------------------------------------------------ value -> string (str and repr)
+variable hq1 variable hq2
+variable 'l>str  variable 'd>str  variable 't>str      \ forward references (mutually recursive with v>str)
+: s-quote ( s -- s' ) 0 hq1 ! 0 hq2 ! dup s>al over + swap begin 2dup > while dup c@ dup [char] ' = if 1 hq1 ! then 34 = if 1 hq2 ! then 1+ repeat 2drop
+   hq1 @ hq2 @ 0= and if 34 else [char] ' then ( s q )
+   over @ 2* 2 + sbuf >r dup put-char
+   over s>al over + swap ( s q end a ) begin 2dup > while dup c@
+      dup 10 = if drop 92 put-char [char] n put-char else
+      dup 13 = if drop 92 put-char [char] r put-char else
+      dup 9 = if drop 92 put-char [char] t put-char else
+      dup 92 = if drop 92 put-char 92 put-char else
+      dup 4 pick = if 92 put-char put-char else put-char then then then then then
+      1+ repeat 2drop ( s q ) put-char drop r> sbuf> ;
+: bool>str ( v -- s ) if s" True" else s" False" then mkstr ;
+: v>str ( v t -- s )
+   case 0 of int>str endof 5 of bool>str endof 1 of float>str endof 2 of endof 4 of drop s" None" mkstr endof
+        3 of 'l>str @ execute endof 7 of 't>str @ execute endof 6 of 'd>str @ execute endof drop drop s" <unbound>" mkstr 0 endcase ;
+: v>repr ( v t -- s ) dup 2 = if drop s-quote exit then v>str ;
+: l>str ( l -- s ) dup @ 0 s" [" mkstr ( l n i acc )
+   begin 2 pick 2 pick > while
+      over if s" , " mkstr s-concat then
+      3 pick 2 pick l-at 2@ v>repr s-concat
+      swap 1+ swap repeat
+   s" ]" mkstr s-concat nip nip nip ;
+: d>str ( d -- s ) 0 s" {" mkstr ( d i acc )
+   begin 2 pick 2 pick d-next ?dup while ( d i acc i' slot )
+      >r rot drop swap r> ( d i' acc slot )
+      over @ 1 > if swap s" , " mkstr s-concat swap then
+      dup 2@ v>repr rot swap s-concat swap
+      s" : " mkstr rot swap s-concat swap
+      16 + 2@ v>repr s-concat
+   repeat drop s" }" mkstr s-concat nip nip ;
+: t>str ( l -- s ) dup @ 0 s" (" mkstr ( l n i acc )
+   begin 2 pick 2 pick > while
+      over if s" , " mkstr s-concat then
+      3 pick 2 pick l-at 2@ v>repr s-concat
+      swap 1+ swap repeat
+   over 1 = if s" ,)" else s" )" then mkstr s-concat nip nip nip ;
+' l>str 'l>str !  ' d>str 'd>str !  ' t>str 't>str !
+: print-args ( v1 t1 ... vn tn n -- )  \ print(): space separated
+   dup 0= if drop exit then 1- >r v>str r> dup >r swap >r print-args r> r> 0 > if space then s>al type ;
+: rt-print ( ... n -- ) print-args cr ;
+
+\ ------------------------------------------------------------------ dynamic operators
+variable va variable ta variable vb variable tb
+: unpack ( a ta b tb -- ) tb ! vb ! ta ! va ! ;
+: both-int? ( -- f ) ta @ int? tb @ int? and ;
+: both-num? ( -- f ) ta @ num? tb @ num? and ;
+: fa ( -- f ) va @ ta @ >f ;   : fb ( -- f ) vb @ tb @ >f ;
+: op-error ( addr len -- ) s" TypeError: unsupported operand types for " err-type rt-fatal ;
+: zero-div s" ZeroDivisionError: division by zero" rt-fatal ;
+: rt+ ( a ta b tb -- r tr ) unpack
+   both-int? if va @ vb @ + 0 exit then   both-num? if fa fb f+ 1 exit then
+   ta @ 2 = tb @ 2 = and if va @ vb @ s-concat 2 exit then
+   ta @ seq? ta @ tb @ = and if va @ vb @ l-concat ta @ exit then  s" +" op-error ;
+: rt- unpack both-int? if va @ vb @ - 0 exit then both-num? if fa fb f- 1 exit then s" -" op-error ;
+: rt* unpack both-int? if va @ vb @ * 0 exit then both-num? if fa fb f* 1 exit then
+   ta @ 2 = tb @ int? and if va @ vb @ s-repeat 2 exit then  tb @ 2 = ta @ int? and if vb @ va @ s-repeat 2 exit then
+   ta @ seq? tb @ int? and if va @ vb @ l-repeat ta @ exit then  tb @ seq? ta @ int? and if vb @ va @ l-repeat tb @ exit then
+   s" *" op-error ;
+: rt/ unpack both-num? 0= if s" /" op-error then fb 0.0 f= if zero-div then fa fb f/ 1 ;
+: floordiv ( a b -- q ) 2dup / >r 2dup mod 0<> -rot xor 0 < and r> swap if 1- then ;
+: pymod ( a b -- r ) tuck mod dup 0<> if 2dup xor 0 < if + exit then then nip ;
+: rt// unpack both-int? if vb @ 0= if zero-div then va @ vb @ floordiv 0 exit then
+   both-num? if fb 0.0 f= if zero-div then fa fb f/ floor 1 exit then s" //" op-error ;
+variable 'str%
+: rt% unpack ta @ 2 = if va @ vb @ tb @ 'str% @ execute exit then
+   both-int? if vb @ 0= if zero-div then va @ vb @ pymod 0 exit then
+   both-num? if fb 0.0 f= if zero-div then fa fa fb f/ floor fb f* f- 1 exit then s" %" op-error ;
+: ipow ( a n -- p ) 1 swap 0 begin 2dup > while >r >r over * r> r> 1+ repeat 2drop nip ;
+: fipow ( a n -- r )  \ float to a non-negative integer power by squaring
+   1.0 -rot begin dup 0 > while dup 1 and if rot 2 pick f* -rot then swap dup f* swap 1 rshift repeat 2drop ;
+: fpow ( a b -- r )
+   dup 0.5 f= if drop dup 0.0 f>= if fsqrt exit then then
+   dup dup f>s s>f f= over fabs 1024.0 f< and if f>s dup 0 < if negate fipow 1.0 swap f/ else fipow then exit then
+   over 0.0 f> if swap fln f* fexp exit then
+   over 0.0 f= if nip dup 0.0 f> if drop 0.0 exit then 0.0 f= if 1.0 exit then zero-div then
+   dup dup f>s s>f f<> if s" ValueError: negative number cannot be raised to a fractional power" rt-fatal then
+   dup f>s 1 and >r swap fnegate fln f* fexp r> if fnegate then ;
+: rt** unpack both-int? if vb @ 0 >= if va @ vb @ ipow 0 exit then fa fb fpow 1 exit then
+   both-num? if fa fb fpow 1 exit then s" **" op-error ;
+: rt-neg ( v t -- v t ) dup int? if drop negate 0 exit then dup 1 = if drop fnegate 1 exit then
+   s" TypeError: bad operand type for unary -" rt-fatal ;
+variable 'l-cmp
+: rt-cmp ( a ta b tb -- n ) unpack
+   both-int? if va @ vb @ 2dup < if 2drop -1 else > if 1 else 0 then then exit then
+   both-num? if fa fb 2dup f< if 2drop -1 else f> if 1 else 0 then then exit then
+   ta @ 2 = tb @ 2 = and if va @ vb @ s-cmp exit then
+   ta @ seq? ta @ tb @ = and if va @ vb @ 'l-cmp @ execute exit then
+   s" TypeError: comparison not supported between these types" rt-fatal ;
+: l-cmp ( l1 l2 -- n )  \ lexicographic, like Python
+   dup @ 0 ( l1 l2 n2 i ) begin 2dup > 3 pick @ 2 pick > and while
+      3 pick over l-at 2@ 4 pick 3 pick l-at 2@ rt-cmp ?dup if nip nip nip nip exit then 1+ repeat
+   drop drop @ swap @ 2dup < if 2drop -1 else > if 1 else 0 then then ;
+' l-cmp 'l-cmp !
+: rt<  rt-cmp 0 <  5 ;   : rt>  rt-cmp 0 >  5 ;   : rt<= rt-cmp 0 <= 5 ;   : rt>= rt-cmp 0 >= 5 ;
+: v= ( a ta b tb -- f )
+   dup seq? 3 pick seq? and if dup 3 pick <> if 2drop 2drop 0 exit then drop nip 'l= @ execute exit then
+   dup 6 = 3 pick 6 = and if drop nip = exit then
+   dup seq? 3 pick seq? or if 2drop 2drop 0 exit then
+   dup 6 = 3 pick 6 = or if 2drop 2drop 0 exit then  key= ;
+: l= ( l1 l2 -- f ) 2dup = if 2drop 1 exit then over @ over @ <> if 2drop 0 exit then
+   dup @ 0 begin 2dup > while ( l1 l2 n i ) 3 pick over l-at 2@ 4 pick 3 pick l-at 2@ v= 0= if 2drop 2drop 0 exit then 1+ repeat
+   2drop 2drop 1 ;
+' l= 'l= !
+: rt-is ( a ta b tb -- f 5 ) rot = -rot = and 5 ;   : rt-is-not ( a ta b tb -- f 5 ) rt-is drop 0= 5 ;
+: rt== v= 5 ;   : rt!= v= 0= 5 ;
+: rt-truthy ( v t -- f ) case 0 of 0<> endof 5 of endof 1 of 0.0 f<> endof 2 of @ 0<> endof 3 of @ 0<> endof 7 of @ 0<> endof 6 of @ 0<> endof
+   4 of drop 0 endof drop drop 0 0 endcase ;
+: rt-not rt-truthy 0= 5 ;
+
+\ ------------------------------------------------------------------ indexing, slicing, membership
+: norm-index ( i len -- i' ) over 0 < if + else drop then ;
+: index-error s" IndexError: index out of range" rt-fatal ;
+: key-error ( v t -- ) s" KeyError: " err-type v>repr s>al rt-fatal ;
+: rt-index ( a ta i ti -- v t ) unpack
+   ta @ 6 = if va @ vb @ tb @ d-get 0= if 2drop vb @ tb @ key-error then exit then
+   tb @ int? 0= if s" TypeError: indices must be integers" rt-fatal then
+   ta @ seq? if vb @ va @ @ norm-index dup va @ @ u< 0= if index-error then va @ swap l-at 2@ exit then
+   ta @ 2 = if vb @ va @ @ norm-index dup va @ @ u< 0= if index-error then va @ swap s-char 2 exit then
+   s" TypeError: object is not subscriptable" rt-fatal ;
+: rt-setindex ( v t a ta i ti -- ) unpack
+   ta @ 6 = if va @ vb @ tb @ d-set exit then
+   ta @ 3 = tb @ int? and if vb @ va @ @ norm-index dup va @ @ u< 0= if index-error then va @ swap l-at 2! exit then
+   ta @ 7 = if s" TypeError: 'tuple' object does not support item assignment" rt-fatal then
+   s" TypeError: object does not support item assignment" rt-fatal ;
+: clamp ( i len -- i' ) >r dup 0 < if r@ + 0 max then r> min ;
+: slice-bound ( v t len default -- i' ) 2swap dup 4 = if 2drop nip exit then
+   int? 0= if s" TypeError: slice indices must be integers or None" rt-fatal then nip swap clamp ;
+: rt-slice ( a ta i ti j tj -- r t )
+   4 pick 2 = 5 pick seq? or 0= if s" TypeError: object is not subscriptable" rt-fatal then
+   >r >r 3 pick @ 0 slice-bound r> r> 4 pick @ dup slice-bound ( a ta i j ) over - 0 max
+   rot dup seq? if >r l-copy r> else drop s-sub 2 then ;
+: rt-in ( x tx c tc -- f t )
+   dup seq? if drop dup @ 0 begin 2dup > while 4 pick 4 pick 4 pick 3 pick l-at 2@ v= if 2drop 2drop drop 1 5 exit then 1+ repeat
+      2drop drop 2drop 0 5 exit then
+   dup 6 = if drop -rot d-probe nip 5 exit then
+   dup 2 = if drop over 2 <> if s" TypeError: 'in <string>' requires string as left operand" rt-fatal then nip swap s-find 0 >= 5 exit then
+   s" TypeError: argument is not iterable" rt-fatal ;
+: rt-not-in rt-in drop 0= 5 ;
+
+\ ------------------------------------------------------------------ frames, locals, globals
+variable fp variable lp   16777216 allocate constant LS   LS lp !  LS fp !
+: set-line ( n -- ) cur-line ! ;
+: arity-error ( nargs k -- ) s" TypeError: function takes " err-type err-int s"  positional arguments but " err-type err-int s"  were given" rt-fatal ;
+: pop-args ( v0 t0 ... k -- ) begin dup 0 > while 1- dup >r 16* fp @ + 2! r> repeat drop ;
+: enter ( args... nargs k n -- )
+   2 pick 2 pick <> if drop arity-error then
+   lp @ LS 16777216 + 1048576 - > if s" RecursionError: maximum recursion depth exceeded" rt-fatal then
+   fp @ lp @ !  lp @ 8 + fp !  dup 16* fp @ + lp !
+   over - 16* >r 16* fp @ + r> 255 fill  pop-args ;
+: leave ( -- ) fp @ 8 - dup lp ! @ fp ! ;
+: ld ( i -- v t ) 16* fp @ + 2@ dup -1 = if s" UnboundLocalError: local variable referenced before assignment" rt-fatal then ;
+: st ( v t i -- ) 16* fp @ + 2! ;
+: ldg ( cell -- v t ) dup 2@ dup -1 = if 2drop s" NameError: name '" err-type 16 + @ s>al err-type s" ' is not defined" rt-fatal then rot drop ;
+: stg ( v t cell -- ) 2! ;
+
+\ ------------------------------------------------------------------ glue used by compiled code
+: list0 ( -- l ) 8 mklist ;
+: list1 ( v t -- l ) list0 >r r@ l-append r> ;
+: l-append1 ( l v t -- l ) rot dup >r l-append r> ;
+: dict0 ( -- d ) mkdict ;
+: d-set1 ( d kv kt vv vt -- d ) 2swap 4 pick -rot d-set ;
+: unpack-n ( v t n -- l ) over seq? 0= if s" TypeError: cannot unpack non-iterable object" rt-fatal then
+   nip over @ <> if s" ValueError: wrong number of values to unpack" rt-fatal then ;
+variable ag-v variable ag-t
+: rt-setindex-r ( a ta i ti v t -- ) ag-t ! ag-v ! unpack ag-v @ ag-t @ va @ ta @ vb @ tb @ rt-setindex ;
+: l-remove-at ( l i -- ) over >r over @ over - 1- >r ( l i ) 2dup 1+ l-at -rot l-at r> 16* cmove -1 r> +! ;
+: rt-delitem ( a ta i ti -- ) unpack
+   ta @ 6 = if va @ vb @ tb @ d-del 0= if vb @ tb @ key-error then exit then
+   ta @ 3 = tb @ int? and if vb @ va @ @ norm-index dup va @ @ u< 0= if index-error then va @ swap l-remove-at exit then
+   ta @ 7 = if s" TypeError: 'tuple' object doesn't support item deletion" rt-fatal then
+   s" TypeError: object does not support item deletion" rt-fatal ;
+: assert-fail ( -- ) s" AssertionError" rt-fatal ;
+\ iterators: [kind 8][a 8][b 8][c 8]   kind 0 list(a=list b=idx)  1 range(a=cur b=stop c=step)  2 str(a=s b=idx)
+: mk-range ( args... nargs -- it ) 32 alloc0 >r 1 r@ !
+   dup 1 = if drop int? 0= if s" TypeError: range() arguments must be integers" rt-fatal then r@ 16 + ! 1 r@ 24 + ! r> exit then
+   dup 2 = if drop int? 0= if s" TypeError: range() arguments must be integers" rt-fatal then r@ 16 + ! int? 0= if s" TypeError: range() arguments must be integers" rt-fatal then r@ 8 + ! 1 r@ 24 + ! r> exit then
+   dup 3 = if drop int? 0= if s" TypeError: range() arguments must be integers" rt-fatal then dup 0= if s" ValueError: range() step must not be zero" rt-fatal then r@ 24 + !
+      int? 0= if s" TypeError: range() arguments must be integers" rt-fatal then r@ 16 + ! int? 0= if s" TypeError: range() arguments must be integers" rt-fatal then r@ 8 + ! r> exit then
+   s" TypeError: range expected 1 to 3 arguments" rt-fatal ;
+: d-keys ( d -- l ) dup @ 1 max mklist >r 0 begin 2dup d-next ( d i i' slot ) ?dup while 2@ r@ l-append nip repeat drop 2drop r> ;
+: mk-iter ( v t -- it ) 32 alloc0 >r
+   dup seq? if drop r@ 8 + ! 0 r@ ! r> exit then
+   dup 2 = if drop r@ 8 + ! 2 r@ ! r> exit then
+   dup 6 = if drop d-keys r@ 8 + ! 0 r@ ! r> exit then
+   s" TypeError: object is not iterable" rt-fatal ;
+: iter-next ( it -- v t 1 | 0 ) dup @ case
+   0 of dup 16 + @ over 8 + @ @ < if dup 8 + @ over 16 + @ l-at 2@ rot 16 + 1 swap +! 1 else drop 0 then endof
+   1 of dup 24 + @ 0 > if dup 8 + @ over 16 + @ < else dup 8 + @ over 16 + @ > then
+        if dup 8 + @ 0 rot dup 24 + @ swap 8 + +! 1 else drop 0 then endof
+   2 of dup 16 + @ over 8 + @ @ < if dup 8 + @ over 16 + @ s-char 2 rot 16 + 1 swap +! 1 else drop 0 then endof
+   drop drop 0 0 endcase ;
+\ print with keywords: print(..., end=, sep=)
+variable pk-end variable pk-sep 0 pk-end ! 0 pk-sep !
+: print-set-end ( v t -- ) 2 <> if s" TypeError: end must be a string" rt-fatal then pk-end ! ;
+: print-set-sep ( v t -- ) 2 <> if s" TypeError: sep must be a string" rt-fatal then pk-sep ! ;
+: print-sep ( -- ) pk-sep @ ?dup if s>al type else space then ;
+: print-args-kw ( v1 t1 ... vn tn n -- )
+   dup 0= if drop exit then 1- >r v>str r> dup >r swap >r recurse r> r> 0 > if print-sep then s>al type ;
+: rt-print-kw ( v1 t1 ... vn tn n -- v t ) print-args-kw
+   pk-end @ ?dup if s>al type else cr then 0 pk-end ! 0 pk-sep ! none ;
+\ bitwise operators (ints only)
+: int-op-check ( -- ) both-int? 0= if s" bitwise operators" op-error then ;
+: rshift-signed ( n k -- n' ) over 0 < if swap invert swap rshift invert else rshift then ;
+: rt<< unpack int-op-check va @ vb @ lshift 0 ;   : rt>> unpack int-op-check va @ vb @ rshift-signed 0 ;
+: rt&  unpack int-op-check va @ vb @ and 0 ;      : rt|  unpack int-op-check va @ vb @ or 0 ;
+: rt^  unpack int-op-check va @ vb @ xor 0 ;
+: rt~  ( v t -- v' t ) int? 0= if s" TypeError: bad operand type for unary ~" rt-fatal then invert 0 ;

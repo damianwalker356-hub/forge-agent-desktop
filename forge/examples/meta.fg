@@ -1,0 +1,44 @@
+\ meta.fg — the language extending itself at run time.
+\ Everything below is ordinary Forge code; no kernel change is needed to add syntax.
+\ Run:  ./forge core.fg examples/meta.fg
+
+\ 1. A new control structure:   n times ... end
+: times   0 postpone literal postpone do ; immediate compile-only   \ compiles  n 0 do
+: end     postpone loop ;            immediate compile-only
+: demo1   5 times i 1+ . end cr ;
+." 1. times/end:        " demo1
+
+\ 2. A struct generator — each field name becomes a word returning its offset
+: struct     ( -- 0 )                  0 ;
+: field      ( off size "name" -- off' ) over constant + ;
+: end-struct ( size "name" -- )         constant ;
+struct  8 field cyl.bore   8 field cyl.stroke   8 field cyl.rod  end-struct cylinder
+." 2. struct:           cylinder is " cylinder . ." bytes, cyl.rod at offset " cyl.rod . cr
+
+\ 3. A declarative mini-DSL for an engine spec, compiled into a lookup table
+create spec  16 cells allot
+variable nkeys  0 nkeys !
+: key:   ( "name" -- )   nkeys @ cells spec + constant  1 nkeys +! ;   \ define a key as a slot address
+key: cylinders   key: bore   key: stroke   key: redline
+: :=  ( addr n -- )  swap ! ;
+cylinders 6 :=   bore 86 :=   stroke 86 :=   redline 7200 :=
+: displacement ( -- cc ) bore @ dup * 7854 * stroke @ * cylinders @ * 10000000 / ;
+." 3. DSL spec:         " cylinders @ . ." cyl, " displacement . ." cc, redline " redline @ . cr
+
+\ 4. Code generation: build a word at run time from a string with the compiler words
+: define-poly ( a b c "name" -- )          \ makes  name ( x -- a*x*x + b*x + c )
+  >r >r >r                                   \ then  :  opens a definition named by the next input token
+  :
+  postpone dup postpone dup postpone *
+  r> postpone literal postpone *
+  postpone swap r> postpone literal postpone * postpone +
+  r> postpone literal postpone +
+  postpone ; ;
+3 2 1 define-poly poly        \ poly(x) = 3x^2 + 2x + 1
+." 4. generated word:   poly(10) = " 10 poly . ."  poly(-2) = " -2 poly . cr
+
+\ 5. case/of is itself written in core.fg — a library word, not kernel syntax
+: stroke-name ( n -- )  case 1 of ." intake" endof 2 of ." compression" endof 3 of ." power" endof 4 of ." exhaust" endof ." ?" endcase ;
+: demo5  5 1 do i stroke-name space loop cr ;
+." 5. case/of:          " demo5
+bye

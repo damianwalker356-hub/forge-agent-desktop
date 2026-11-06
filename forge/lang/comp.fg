@@ -1,0 +1,396 @@
+\ comp.fg — single-pass compiler: Python-like source -> x86-64 machine code in the Forge dictionary.
+\ Token stream comes from lex.fg; runtime support from rt.fg.  Generated code calls runtime words
+\ with `compile,` (call rel32), pushes constants with `literal`, and uses its own jump emission.
+
+\ ------------------------------------------------------------------ token cursor
+variable tp
+: cur    ( -- a ) tp @ tok ;
+: ct     ( -- type ) cur tok.type ;
+: cv     ( -- val ) cur tok.val ;
+: cline  ( -- n ) cur tok.line ;
+: adv    ( -- ) 1 tp +! ;
+: tok@   ( i -- type val ) tok dup tok.type swap tok.val ;
+: op?    ( code -- f ) ct 5 = if cv = else drop 0 then ;
+: kw?    ( id -- f ) ct 1 = if cv sym.kw @ = else drop 0 then ;
+: name?  ( -- f ) ct 1 = if cv sym.kw @ 0= else 0 then ;
+: mname? ( -- f ) ct 1 = if cv sym.kw @ dup 0= swap 100 = or else 0 then ;   \ name or module name
+: syntax-error ( addr len -- ) cline cur-line ! s" SyntaxError: " err-type rt-fatal ;
+: err-at ( addr len -- ) cline cur-line ! rt-fatal ;   \ error whose prefix was already written with err-type
+: expect-op ( code -- ) op? 0= if s" unexpected token" syntax-error then adv ;
+: expect-type ( type -- ) ct <> if s" unexpected token" syntax-error then adv ;
+: unsupported ( addr len -- ) cline cur-line ! s" SyntaxError: not supported in Forge 2: " err-type rt-fatal ;
+
+\ ------------------------------------------------------------------ code emission
+: w!     ( n a -- ) over 255 and over c! over 8 rshift 255 and over 1+ c! over 16 rshift 255 and over 2 + c! swap 24 rshift 255 and swap 3 + c! ;
+: rel32, ( -- patch ) here 0 c, 0 c, 0 c, 0 c, ;
+: >code  ( xt -- ) 232 c, here 4 + - rel32, w! ;                       \ call rel32  (kernel's compile, is STATE-checked)
+: lit,   ( n -- ) 72 c, 184 c, , 73 c, 131 c, 238 c, 8 c, 73 c, 137 c, 6 c, ;   \ mov rax,imm64; sub r14,8; mov [r14],rax
+: lit-addr ( -- a ) here 2 + ;            \ address of the imm64 inside the literal about to be emitted
+: val,   ( v t -- ) swap lit, lit, ;
+: none,  ( -- ) 0 lit, 4 lit, ;
+: pop-test, ( -- ) 73 c, 139 c, 6 c, 73 c, 131 c, 198 c, 8 c, 72 c, 133 c, 192 c, ;   \ mov rax,[r14]; add r14,8; test rax,rax
+: emit-jz-raw  ( -- patch ) pop-test, 15 c, 132 c, rel32, ;
+: emit-jnz-raw ( -- patch ) pop-test, 15 c, 133 c, rel32, ;
+: emit-jmp     ( -- patch ) 233 c, rel32, ;
+: patch!       ( patch -- ) here over 4 + - swap w! ;
+: jmp-to       ( target -- ) 233 c, here 4 + - rel32, w! ;
+: emit-jz      ( -- patch ) ['] rt-truthy >code emit-jz-raw ;
+: ret,         ( -- ) 195 c, ;
+: line,        ( -- ) cline lit, ['] set-line >code ;
+
+\ ------------------------------------------------------------------ scopes
+variable in-func  0 in-func !      \ 0 at top level, 1 inside a def
+variable nloc                        \ number of local slots in the current def
+variable nhidden 0 nhidden !         \ hidden temporaries allocated at top level (global cells)
+256 array touched variable ntouched 0 ntouched !
+: touch ( sym -- ) ntouched @ cells touched + ! 1 ntouched +! ;
+: add-local ( sym -- ) dup sym.slot @ 0<> if drop exit then nloc @ 1+ over sym.slot ! touch 1 nloc +! ;
+: force-global ( sym -- ) -1 over sym.slot ! touch ;
+: clear-locals ( -- ) ntouched @ 0 begin 2dup > while dup cells touched + @ 0 swap sym.slot ! 1+ repeat 2drop 0 ntouched ! 0 nloc ! ;
+: hidden-slot ( -- i ) nloc @ 1 nloc +! ;
+: gcell ( sym -- cell ) dup sym.gcell @ ?dup if nip exit then
+   24 alloc >r -1 r@ 8 + ! dup sym>al mkstr r@ 16 + ! r@ over sym.gcell ! drop r> ;
+: hidden-cell ( -- cell ) 24 alloc dup 8 + 0 swap ! dup 16 + s" <hidden>" mkstr swap ! ;
+\ a "place" is ( id kind ): kind 0 = local slot id, kind 1 = global cell id
+: sym-place ( sym -- id kind ) dup sym.slot @ dup 0 > if 1- nip 0 exit then drop gcell 1 ;
+: load,  ( id kind -- ) if lit, ['] ldg >code else lit, ['] ld >code then ;
+: store, ( id kind -- ) if lit, ['] stg >code else lit, ['] st >code then ;
+: new-hidden ( -- id kind ) in-func @ if hidden-slot 0 else hidden-cell 1 then ;
+: load-raw, ( id kind -- ) load, ['] drop >code ;   \ hidden slots hold raw pointers tagged 0
+: load-sym,  ( sym -- ) sym-place load, ;
+: store-sym, ( sym -- ) sym-place store, ;
+
+\ ------------------------------------------------------------------ loops (break / continue bookkeeping)
+32 array loop-cont  32 array loop-brk0  variable loop-sp 0 loop-sp !
+1024 array brk-pats  variable nbrk 0 nbrk !
+: loop-begin ( cont-target -- ) loop-sp @ cells loop-cont + ! nbrk @ loop-sp @ cells loop-brk0 + ! 1 loop-sp +! ;
+: loop-end ( -- ) -1 loop-sp +! loop-sp @ cells loop-brk0 + @ ( first )
+   begin dup nbrk @ < while dup cells brk-pats + @ patch! 1+ repeat drop loop-sp @ cells loop-brk0 + @ nbrk ! ;
+: add-break ( patch -- ) nbrk @ cells brk-pats + ! 1 nbrk +! ;
+: in-loop? ( -- f ) loop-sp @ 0 > ;
+
+\ ------------------------------------------------------------------ forward references
+variable 'expr variable 'stmt variable 'suite variable 'expr-list
+: expr ( -- ) 'expr @ execute ;
+: stmt ( -- ) 'stmt @ execute ;
+: suite ( -- ) 'suite @ execute ;
+
+\ ------------------------------------------------------------------ bracket matching on the token stream
+: ttype ( i -- type ) tok tok.type ;
+: tval  ( i -- val ) tok tok.val ;
+: kw-at ( i -- id ) dup ttype 1 = if tval sym.kw @ else drop 0 then ;
+: next-kw ( -- id ) tp @ 1+ kw-at ;
+: bracket-open? ( type val -- f ) swap 5 = if dup [char] ( = over [char] [ = or swap [char] { = or else drop 0 then ;
+: bracket-close? ( type val -- f ) swap 5 = if dup [char] ) = over [char] ] = or swap [char] } = or else drop 0 then ;
+: match-bracket ( i -- j )  \ i at an opening bracket -> index of its closing bracket
+   0 swap begin dup ttype over tval bracket-open? if swap 1+ swap else dup ttype over tval bracket-close? if swap 1- swap then then
+      over 0= if nip exit then
+      dup ttype 9 = if s" unmatched bracket" syntax-error then 1+ again ;
+\ find a depth-0 token satisfying xt ( type val -- f ), scanning from i until NEWLINE / EOF / ';'.  returns index or -1
+: find-top ( i xt -- j ) >r
+   begin dup ttype dup 6 = over 9 = or if 2drop r> drop -1 exit then
+      5 = over tval [char] ; = and if drop r> drop -1 exit then
+      dup ttype over tval r@ execute if r> drop exit then
+      dup ttype over tval bracket-open? if match-bracket then 1+ again ;
+: find-in ( i j xt -- k )  \ like find-top but bounded by index j (exclusive) and ignoring NEWLINEs; -1 if absent
+   >r swap begin 2dup > while
+      dup ttype over tval r@ execute if nip r> drop exit then
+      dup ttype over tval bracket-open? if match-bracket then 1+ repeat 2drop r> drop -1 ;
+: is-assign-op ( type val -- f ) swap 5 = if dup [char] = = swap OP+= OP**= 1+ within or else drop 0 then ;
+: is-comma   ( type val -- f ) swap 5 = if [char] , = else drop 0 then ;
+: is-colon   ( type val -- f ) swap 5 = if [char] : = else drop 0 then ;
+: is-kw-for  ( type val -- f ) swap 1 = if sym.kw @ 7 = else drop 0 then ;
+: is-kw-if   ( type val -- f ) swap 1 = if sym.kw @ 3 = else drop 0 then ;
+: is-kw-else ( type val -- f ) swap 1 = if sym.kw @ 5 = else drop 0 then ;
+
+\ ------------------------------------------------------------------ calls
+: builtin! ( xt addr len -- ) intern sym.builtin ! ;
+: method!  ( xt addr len -- ) intern sym.method ! ;
+: module!  ( addr len -- ) 100 -rot intern sym.kw ! ;
+: module?  ( sym -- f ) sym.kw @ 100 = ;
+: kwarg-ahead? ( -- f ) name? if tp @ 1+ ttype 5 = tp @ 1+ tval [char] = = and else 0 then ;
+: parse-args ( -- nargs )  \ cursor after '(' ; consumes ')'
+   0 begin [char] ) op? 0= while
+      [char] , op? if adv else
+      kwarg-ahead? if s" keyword arguments (only print(..., end=, sep=) is supported)" unsupported then
+      expr 1+ then repeat adv ;
+: parse-print-args ( -- )  \ cursor after '(' : positionals, then end= / sep= ; emits rt-print-kw
+   0 begin [char] ) op? 0= while
+      [char] , op? if adv else
+      kwarg-ahead? if
+         cv sym>al s" end" str= if adv adv expr ['] print-set-end >code else
+         cv sym>al s" sep" str= if adv adv expr ['] print-set-sep >code else
+         s" unknown keyword argument for print()" syntax-error then then
+      else expr 1+ then then repeat adv
+   lit, ['] rt-print-kw >code ;
+: call-sym ( sym -- )  \ cursor at '(' following the name
+   dup sym>al s" print" str= if drop adv parse-print-args exit then
+   dup sym.func @ if adv parse-args lit, sym.func @ >code exit then
+   dup sym.builtin @ ?dup if nip adv parse-args lit, >code exit then
+   dup sym.slot @ 0<> over sym.gcell @ 0<> or if drop s" calling a variable (functions are not first-class values)" unsupported then
+   s" NameError: function '" err-type sym>al err-type s" ' is not defined" err-at ;
+: call-method ( sym -- )  \ object already compiled; cursor at '('
+   dup sym.method @ ?dup 0= if s" AttributeError: unknown method '" err-type sym>al err-type s" '" err-at then
+   nip adv parse-args lit, >code ;
+: module-attr ( -- )  \ cursor after 'module.'
+   mname? 0= if s" expected attribute name" syntax-error then cv adv
+   dup s" pow" intern = if drop s" __fpow" intern then      \ math.pow always returns a float
+   [char] ( op? if dup sym.builtin @ 0= if s" NameError: unknown module function '" err-type sym>al err-type s" '" err-at then call-sym exit then
+   dup sym.gcell @ 0= if s" NameError: unknown module constant '" err-type sym>al err-type s" '" err-at then
+   gcell lit, ['] ldg >code ;
+
+\ ------------------------------------------------------------------ expressions
+variable target-mode  0 target-mode !     \ 1 while compiling an assignment target
+variable assign-op                          \ op code of the pending assignment ('=' or augmented)
+variable rhs-end                            \ token index after the compiled right-hand side
+variable 'or-expr variable 'postfix
+: or-expr ( -- ) 'or-expr @ execute ;
+: aug-xt ( code -- xt ) case OP+= of ['] rt+ endof OP-= of ['] rt- endof OP*= of ['] rt* endof OP/= of ['] rt/ endof
+   OP//= of ['] rt// endof OP%= of ['] rt% endof OP**= of ['] rt** endof drop 0 0 endcase ;
+: final-subscript? ( -- f )  \ cursor at '[' : is its matching ']' followed by the assignment operator?
+   target-mode @ 0= if 0 exit then tp @ match-bracket 1+ dup ttype swap tval is-assign-op ;
+: parse-subscript ( -- )  \ cursor after '[' ; object compiled; compiles index or slice, consumes ']'
+   [char] : op? if none, else expr then
+   [char] : op? if adv [char] : op? if adv [char] ] op? 0= if s" slice step" unsupported then then [char] ] op? if none, else expr then
+      [char] ] expect-op ['] rt-slice >code exit then
+   [char] ] expect-op ['] rt-index >code ;
+: store-subscript ( -- )  \ cursor after '[' of the final target subscript
+   [char] : op? if s" slice assignment" unsupported then
+   0 target-mode ! expr [char] ] expect-op
+   assign-op @ [char] = = if ['] rt-setindex >code adv rhs-end @ tp ! exit then
+   ['] 2over >code ['] 2over >code ['] rt-index >code adv expr assign-op @ aug-xt >code ['] rt-setindex-r >code ;
+: str-atom ( -- ) cv adv begin ct 4 = while cv s-concat adv repeat 2 val, ;
+: expr-list ( -- )  \ expr [, expr]* -> single value, or a list when commas are present (tuple syntax)
+   expr [char] , op? 0= if exit then ['] list1 >code
+   begin [char] , op? while adv
+      ct 6 = ct 9 = or [char] ) op? or [char] ] op? or [char] = op? or if 7 lit, exit then
+      expr ['] l-append1 >code repeat 7 lit, ;
+: expr-end-tok? ( i -- f )  \ does this token end an expression at depth 0?
+   dup ttype dup 6 = over 9 = or if 2drop 1 exit then
+   5 = if tval dup [char] , = over [char] ) = or over [char] ] = or over [char] } = or over [char] : = or over [char] ; = or
+      swap dup [char] = = swap OP+= OP**= 1+ within or or
+   else kw-at dup 7 = swap 5 = or then ;
+: ternary-ahead? ( -- f ) tp @ begin dup expr-end-tok? if drop 0 exit then
+      dup kw-at 3 = if drop 1 exit then
+      dup ttype over tval bracket-open? if match-bracket then 1+ again ;
+: ternary ( -- )  \ a if c else b   (c evaluated first, as in Python)
+   ternary-ahead? 0= if or-expr exit then
+   emit-jmp here ( j1 a-start ) or-expr emit-jmp ( j1 a-start jend ) rot patch!
+   3 kw? 0= if s" expected 'if'" syntax-error then adv or-expr emit-jz ( a-start jend j2 ) rot jmp-to patch!
+   5 kw? 0= if s" expected 'else'" syntax-error then adv recurse patch! ;
+' ternary 'expr !
+: comp-op ( -- xt|0 )  \ comparison operator at cursor -> runtime xt (cursor advanced) or 0
+   ct 5 = if cv case [char] < of ['] rt< endof [char] > of ['] rt> endof OP<= of ['] rt<= endof OP>= of ['] rt>= endof
+      OP== of ['] rt== endof OP!= of ['] rt!= endof drop 0 0 endcase dup if adv then exit then
+   8 kw? if adv ['] rt-in exit then
+   21 kw? if adv 14 kw? if adv ['] rt-is-not else ['] rt-is then exit then
+   14 kw? next-kw 8 = and if adv adv ['] rt-not-in exit then 0 ;
+variable 'bitor
+: bitor ( -- ) 'bitor @ execute ;
+: comparison ( -- ) bitor comp-op ?dup 0= if exit then
+   tp @ bitor ( xt bstart ) swap >code
+   begin comp-op ?dup while ( bstart xt )
+      ['] 2dup >code emit-jz ['] 2drop >code ( bstart xt patch )
+      tp @ 3 pick tp ! bitor tp ! ( bstart xt patch ) rot drop tp @ -rot ( bstart' xt patch ) >r bitor >code r> patch! repeat drop ;
+: not-expr ( -- ) 14 kw? next-kw 8 <> and if adv recurse ['] rt-not >code exit then comparison ;
+: and-expr ( -- ) not-expr begin 12 kw? while adv ['] 2dup >code emit-jz ['] 2drop >code not-expr patch! repeat ;
+: or-expr-def ( -- ) and-expr begin 13 kw? while adv ['] 2dup >code ['] rt-truthy >code emit-jnz-raw ['] 2drop >code and-expr patch! repeat ;
+' or-expr-def 'or-expr !
+variable 'arith
+: arith ( -- ) 'arith @ execute ;
+: shift-expr ( -- ) arith begin OP<< op? OP>> op? or while OP<< op? adv if ['] rt<< else ['] rt>> then arith >code repeat ;
+: bitand ( -- ) shift-expr begin [char] & op? while adv shift-expr ['] rt& >code repeat ;
+: bitxor ( -- ) bitand begin [char] ^ op? while adv bitand ['] rt^ >code repeat ;
+: bitor-def ( -- ) bitxor begin [char] | op? while adv bitxor ['] rt| >code repeat ;
+' bitor-def 'bitor !
+variable 'factor
+: factor ( -- ) 'factor @ execute ;
+: term ( -- ) factor begin ct 5 = cv [char] * = cv [char] / = or cv OP// = or cv [char] % = or and while
+   cv adv factor case [char] * of ['] rt* endof [char] / of ['] rt/ endof OP// of ['] rt// endof [char] % of ['] rt% endof endcase >code repeat ;
+: arith-def ( -- ) term begin ct 5 = cv [char] + = cv [char] - = or and while cv adv term [char] + = if ['] rt+ else ['] rt- then >code repeat ;
+' arith-def 'arith !
+: postfix ( -- ) 'postfix @ execute ;
+: power ( -- ) postfix OP** op? if adv factor ['] rt** >code then ;
+: factor-def ( -- )
+   [char] - op? if adv recurse ['] rt-neg >code exit then
+   [char] + op? if adv recurse exit then
+   [char] ~ op? if adv recurse ['] rt~ >code exit then power ;
+' factor-def 'factor !
+
+\ comprehension and literals
+8 array for-targets variable nfor
+: parse-targets ( -- )  \ NAME [, NAME]* -> for-targets / nfor  (cursor stops at 'in')
+   0 nfor ! begin name? 0= if s" expected loop variable" syntax-error then cv nfor @ cells for-targets + ! 1 nfor +! adv
+      [char] , op? while adv repeat ;
+: store-targets ( -- )  \ value on runtime stack -> targets
+   nfor @ 1 = if for-targets @ store-sym, exit then
+   nfor @ lit, ['] unpack-n >code nfor @ 0 begin 2dup > while
+      ['] dup >code dup lit, ['] l-at >code ['] 2@ >code dup cells for-targets + @ store-sym, 1+ repeat 2drop ['] drop >code ;
+: range-call? ( -- f ) name? if cv sym>al s" range" str= cv sym.func @ 0= and tp @ 1+ ttype 5 = and tp @ 1+ tval [char] ( = and else 0 then ;
+: compile-iterable ( -- )  \ emits code leaving a raw iterator pointer
+   range-call? if adv adv parse-args lit, ['] mk-range >code else expr ['] mk-iter >code then ;
+: jz-to ( target -- ) pop-test, 15 c, 132 c, here 4 + - rel32, w! ;
+: list-comp ( cj -- )  \ cursor after '[' ; cj = index of the closing ']'
+   ['] list0 >code new-hidden 0 lit, 2dup store, ( cj Lid Lk )
+   tp @ dup 4 pick ['] is-kw-for find-in tp ! adv parse-targets
+   8 kw? 0= if s" expected 'in'" syntax-error then adv compile-iterable
+   new-hidden 0 lit, 2dup store, ( cj Lid Lk estart ITid ITk )
+   here -rot 2dup load-raw, ['] iter-next >code emit-jz-raw ( cj Lid Lk estart top ITid ITk pend ) >r 2drop ( cj Lid Lk estart top ) r> ( ... top pend )
+   store-targets
+   3 kw? if adv expr ['] rt-truthy >code over jz-to then
+   [char] ] op? 0= if s" expected ']'" syntax-error then
+   rot tp ! expr ( cj Lid Lk top pend ) 3 pick 3 pick load-raw, ['] l-append >code
+   swap jmp-to patch! ( cj Lid Lk ) load-raw, 3 lit, 1+ tp ! ;
+: list-atom ( -- ) \ cursor at '['
+   tp @ match-bracket adv ( cj ) dup tp @ swap ['] is-kw-for find-in -1 <> if list-comp exit then drop
+   ['] list0 >code begin [char] ] op? 0= while [char] , op? if adv else expr ['] l-append1 >code then repeat adv 3 lit, ;
+: dict-atom ( -- ) \ cursor at '{'
+   adv ['] dict0 >code begin [char] } op? 0= while
+      [char] , op? if adv else expr [char] : op? 0= if s" set literals / dict comprehensions" unsupported then adv expr ['] d-set1 >code then repeat adv 6 lit, ;
+: paren-atom ( -- ) \ cursor at '('
+   adv [char] ) op? if adv ['] list0 >code 7 lit, exit then
+   tp @ 1- match-bracket tp @ swap ['] is-kw-for find-in -1 <> if s" generator expressions" unsupported then
+   expr-list [char] ) expect-op ;
+: name-atom ( -- )
+   cv dup module? tp @ 1+ ttype 5 = and tp @ 1+ tval [char] . = and if drop adv adv module-attr exit then
+   tp @ 1+ ttype 5 = tp @ 1+ tval [char] ( = and if adv call-sym exit then
+   adv load-sym, ;
+: atom ( -- )
+   ct case
+     2 of cv adv 0 val, endof
+     3 of cv adv 1 val, endof
+     4 of str-atom endof
+     1 of cv sym.kw @ case 0 of name-atom endof 100 of name-atom endof 15 of adv 1 5 val, endof 16 of adv 0 5 val, endof 17 of adv none, endof
+          22 of s" lambda" unsupported endof 29 of s" yield" unsupported endof 35 of s" await" unsupported endof
+          s" unexpected keyword" syntax-error endcase endof
+     5 of cv case [char] ( of paren-atom endof [char] [ of list-atom endof [char] { of dict-atom endof s" unexpected operator" syntax-error endcase endof
+     6 of s" unexpected end of line" syntax-error endof
+     s" unexpected token" syntax-error endcase ;
+: postfix-def ( -- ) atom
+   begin
+      [char] [ op? if final-subscript? if adv store-subscript else adv parse-subscript then else
+      [char] . op? if adv name? 0= if s" expected method name" syntax-error then cv adv
+         [char] ( op? 0= if s" attribute access (only method calls obj.name(...) are supported)" unsupported then call-method else
+      [char] ( op? if s" calling an expression result" unsupported else exit then then then
+   again ;
+' postfix-def 'postfix !
+
+\ ------------------------------------------------------------------ statements
+: expect-newline ( -- ) ct 6 <> ct 9 <> and if s" expected end of line" syntax-error then ct 6 = if adv then ;
+: stmt-start? ( i -- f ) 1- dup 0 < if drop 1 exit then dup ttype dup 6 = over 7 = or over 8 = or nip swap dup ttype 5 = swap tval [char] ; = and or ;
+: assign-stmt ( eq -- )  \ cursor at statement start; eq = index of the assignment operator
+   dup tval assign-op ! tp @ >r ( eq )
+   assign-op @ [char] = = if
+      dup 1+ tp ! expr-list tp @ rhs-end ! r> tp !   \ RHS first (Python order), then back to the target
+      name? tp @ 1+ 2 pick = and if drop cv adv adv store-sym, rhs-end @ tp ! exit then
+      name? tp @ 1+ ttype 5 = and tp @ 1+ tval [char] , = and if
+         parse-targets tp @ <> if s" invalid assignment target" syntax-error then store-targets rhs-end @ tp ! exit then
+      drop 1 target-mode ! expr 0 target-mode ! exit then
+   r> drop
+   name? tp @ 1+ 2 pick = and if drop cv dup load-sym, adv adv expr assign-op @ aug-xt >code store-sym, exit then
+   drop 1 target-mode ! expr 0 target-mode ! ;
+variable 'small-stmt
+: simple-stmt ( -- )
+   line,
+   ct 1 = if cv sym.kw @ dup if 'small-stmt @ execute exit then drop then
+   tp @ ['] is-assign-op find-top dup -1 <> if assign-stmt exit then drop
+   expr-list ['] 2drop >code ;
+: simple-line ( -- ) begin simple-stmt [char] ; op? if adv ct 6 = ct 9 = or else 1 then until expect-newline ;
+: suite-def ( -- ) [char] : expect-op
+   ct 6 = if adv 7 expect-type begin ct 8 <> while ct 9 = if s" unexpected end of file" syntax-error then stmt repeat adv
+   else simple-line then ;
+' suite-def 'suite !
+: if-stmt ( -- ) adv expr emit-jz suite
+   4 kw? if emit-jmp swap patch! recurse patch! exit then
+   5 kw? if adv emit-jmp swap patch! suite patch! exit then
+   patch! ;
+: while-stmt ( -- ) adv here dup loop-begin expr emit-jz suite swap jmp-to patch! loop-end
+   5 kw? if s" while ... else" unsupported then ;
+: for-stmt ( -- ) adv parse-targets 8 kw? 0= if s" expected 'in'" syntax-error then adv
+   compile-iterable new-hidden 0 lit, 2dup store, ( id kind )
+   here -rot load-raw, ['] iter-next >code emit-jz-raw ( top pend ) store-targets over loop-begin
+   suite swap jmp-to patch! loop-end
+   5 kw? if s" for ... else" unsupported then ;
+: return-stmt ( -- ) in-func @ 0= if s" 'return' outside function" syntax-error then adv
+   ct 6 = ct 9 = or [char] ; op? or if none, else expr-list then ['] leave >code ret, ;
+
+: skip-names ( -- ) begin mname? while adv [char] , op? if adv then repeat ;
+: global-stmt ( -- ) adv skip-names ;
+: check-module ( sym -- ) dup module? 0= if s" ModuleNotFoundError: no module named '" err-type sym>al err-type s" '" syntax-error then drop ;
+: import-stmt ( -- ) adv begin mname? while cv check-module adv 25 kw? if s" import ... as" unsupported then [char] , op? if adv then repeat ;
+: from-stmt ( -- ) adv mname? 0= if s" expected module name" syntax-error then cv check-module adv
+   19 kw? 0= if s" expected 'import'" syntax-error then adv [char] * op? if adv exit then skip-names ;
+: del-stmt ( -- ) adv name? 0= if s" expected name after del" syntax-error then cv adv
+   [char] [ op? if load-sym, adv expr [char] ] expect-op ['] rt-delitem >code exit then
+   0 lit, -1 lit, store-sym, ;
+: assert-stmt ( -- ) adv expr ['] rt-truthy >code emit-jnz-raw ['] assert-fail >code patch!
+   [char] , op? if adv expr ['] 2drop >code then ;
+: break-stmt ( -- ) in-loop? 0= if s" 'break' outside loop" syntax-error then adv emit-jmp add-break ;
+: continue-stmt ( -- ) in-loop? 0= if s" 'continue' outside loop" syntax-error then adv loop-sp @ 1- cells loop-cont + @ jmp-to ;
+\ def: pre-scan of the body for locals
+: body-end ( i -- j )  \ i at ':' of a def header -> index just past the body
+   1+ dup ttype 6 <> if begin dup ttype dup 6 = swap 9 = or 0= while 1+ repeat exit then
+   1+ 0 swap begin dup ttype 7 = if swap 1+ swap then dup ttype 8 = if swap 1- swap then over 0= if nip exit then
+      dup ttype 9 = if s" unexpected end of file in function body" syntax-error then 1+ again ;
+: scan-globals ( i j -- ) swap begin 2dup > while
+      dup kw-at 18 = if 1+ begin dup ttype 1 = while
+         dup tval dup sym.slot @ 0 > if s" name is parameter and global" syntax-error then force-global 1+
+         dup ttype 5 = over tval [char] , = and if 1+ then repeat then 1+ repeat 2drop ;
+: add-local-if ( sym -- ) dup sym.kw @ if drop exit then dup sym.slot @ -1 = if drop exit then add-local ;
+variable sl-end variable sl-depth
+: tok-is-op ( i code -- f ) over ttype 5 = if swap tval = else 2drop 0 then ;
+: scan-locals ( i j -- ) sl-end ! 0 sl-depth !
+   begin dup sl-end @ < while
+      dup ttype over tval 2dup bracket-open? if 2drop 1 sl-depth +! else bracket-close? if -1 sl-depth +! then then
+      dup ttype 1 = if
+         dup kw-at 7 = if
+            1+ begin dup ttype 1 = while dup tval add-local-if 1+ dup [char] , tok-is-op if 1+ then repeat
+         else sl-depth @ 0= if
+            dup 1+ ttype over 1+ tval is-assign-op if dup tval add-local-if then
+            dup stmt-start? if dup begin dup ttype 1 = over 1+ [char] , tok-is-op and while 2 + repeat ( i k )
+               dup ttype 1 = over 1+ [char] = tok-is-op and if over begin 2dup > while dup ttype 1 = if dup tval add-local-if then 1+ repeat drop then drop
+            then
+         then then
+      then 1+ repeat drop ;
+: def-stmt ( -- )
+   in-func @ if s" nested def" unsupported then adv
+   name? 0= if s" expected function name" syntax-error then cv adv ( sym )
+   emit-jmp swap ( jskip sym ) 
+   dup sym.func @ dup 0= if s" internal: function stub missing" syntax-error then
+   here over 5 + - swap 1+ w!            \ patch the stub's jmp to the body
+   1 in-func ! 0 nloc !
+   [char] ( expect-op begin [char] ) op? 0= while
+      name? 0= if s" expected parameter name" syntax-error then cv dup sym.slot @ if s" duplicate parameter" syntax-error then add-local adv
+      [char] , op? if adv then repeat adv
+   nloc @ ( jskip sym k ) tp @ dup body-end 2dup scan-globals scan-locals
+   lit, lit-addr 0 lit, ['] enter >code ( jskip sym naddr )
+   suite none, ['] leave >code ret,
+   nloc @ swap ! drop clear-locals 0 in-func ! patch! ;
+: prescan-defs ( -- )  \ create a 5-byte jmp stub for every "def NAME" so forward calls resolve
+   ntok @ 0 begin 2dup > while
+      dup kw-at 1 = over 1+ ttype 1 = and if
+         dup 1+ tval dup sym.func @ 0= if here 233 c, 0 c, 0 c, 0 c, 0 c, swap sym.func ! else drop then then
+      1+ repeat 2drop ;
+: small-stmt ( kw -- )  \ keyword statement that fits on one line (cursor at the keyword)
+   case 2 of return-stmt endof 9 of break-stmt endof 10 of continue-stmt endof 11 of adv endof
+      18 of global-stmt endof 19 of import-stmt endof 24 of from-stmt endof 20 of del-stmt endof 30 of assert-stmt endof
+      23 of s" class" unsupported endof 26 of s" try/except" unsupported endof 28 of s" with" unsupported endof
+      31 of s" raise (use assert or exit())" unsupported endof 29 of s" yield" unsupported endof
+      4 of s" 'elif' without 'if'" syntax-error endof 5 of s" 'else' without 'if'" syntax-error endof
+      1 of s" 'def' must start a line" syntax-error endof 3 of s" 'if' statement cannot follow ';'" syntax-error endof
+      6 of s" 'while' statement cannot follow ';'" syntax-error endof 7 of s" 'for' statement cannot follow ';'" syntax-error endof
+      dup 100 = over 15 = or over 16 = or over 17 = or over 14 = or if drop
+         tp @ ['] is-assign-op find-top dup -1 <> if assign-stmt else drop expr-list ['] 2drop >code then 0
+      else s" unexpected keyword" syntax-error then endcase ;
+' small-stmt 'small-stmt !
+: stmt-def ( -- )
+   ct 6 = if adv exit then
+   ct 7 = if s" unexpected indent" syntax-error then
+   ct 1 = if cv sym.kw @ case
+      1 of def-stmt endof 3 of if-stmt endof 6 of while-stmt endof 7 of for-stmt endof
+      drop simple-line 0 endcase exit then
+   simple-line ;
+' stmt-def 'stmt !
+: compile-program ( -- xt ) 0 tp ! prescan-defs here begin ct 9 <> while stmt repeat ret, ;
+: run-source ( addr len -- ) lex-source compile-program execute ;
+: run-file ( zaddr -- ) read-whole-file run-source ;

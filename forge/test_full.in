@@ -1,0 +1,28 @@
+: fib dup 2 < if exit then 1 - dup fib swap 1 - fib + ;
+20 fib . cr
+: mul2 2 * ;
+: table 5 0 do i mul2 . loop ;
+table cr
+: sum 0 100 1 do i + loop ;
+sum . cr
+5 variable t
+1 t ! t @ . cr
+42 t ! t @ . cr
+here 16 allot here swap - . cr
+1 s" FFI: s-quote string works" type cr
+." Hello from a compiled dot-quote string" cr
+: down 5 begin dup . 1 - dup 0 <= until drop ;
+down cr
+: wloop 5 begin dup 0 > while dup . 1 - repeat drop ;
+wloop cr
+: early 10 0 do i 5 = if unloop exit then i . loop 99 . ;
+early cr
+: mem here 8 allot dup 123 swap ! dup @ . ;
+mem cr
+1 2 + . 3 4 * . 100 7 mod . -8 . 0x1f . cr
+2 3 < . 3 2 < . 5 5 = . 1 0= . cr
+12 10 and . 12 10 or . 12 10 xor . cr
+: findme 99 ;
+' findme execute . cr
+1 s" write syscall via FFI" 0 0 0 1 syscall . cr
+bye

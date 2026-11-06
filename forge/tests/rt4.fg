@@ -1,0 +1,23 @@
+: check ( got expected -- ) 2dup = if 2drop ." ok " else ." FAIL " swap (.) ."  expected " (.) cr abort then ;
+: fcheck ( got expected -- ) 2dup f- fabs 0.000001 f< if 2drop ." ok " else ." FAIL " swap f. ."  expected " f. cr abort then ;
+2 0 3 0 rt+ 0 check 5 check    2 0 3.5 1 rt+ 1 check 5.5 fcheck   1 5 1 0 rt+ 0 check 2 check
+s" ab" mkstr 2 s" cd" mkstr 2 rt+ 2 check s>al type cr
+7 0 2 0 rt/ 1 check 3.5 fcheck   7 0 2 0 rt// 0 check 3 check   -7 0 2 0 rt// 0 check -4 check  7 0 -2 0 rt// 0 check -4 check
+-7 0 2 0 rt% 0 check 1 check   7 0 -2 0 rt% 0 check -1 check  7.5 1 2 0 rt% 1 check 1.5 fcheck  -7.5 1 2 0 rt// 1 check -4.0 fcheck
+2 0 10 0 rt** 0 check 1024 check   2 0 -1 0 rt** 1 check 0.5 fcheck  -2.0 1 3 0 rt** 1 check -8.0 fcheck  2.0 1 0.5 1 rt** 1 check 2.0 fsqrt fcheck
+5 0 rt-neg 0 check -5 check   1.5 1 rt-neg 1 check -1.5 fcheck
+1 0 2 0 rt< 5 check 1 check   2 0 2 0 rt<= 5 check 1 check  2.5 1 2 0 rt> 5 check 1 check  s" a" mkstr 2 s" b" mkstr 2 rt< 5 check 1 check
+1 0 1.0 1 rt== 5 check 1 check  1 0 s" 1" mkstr 2 rt== 5 check 0 check  none none rt== 5 check 1 check  1 5 1 0 rt== 5 check 1 check
+2 mklist constant A  1 0 A l-append 2 0 A l-append  2 mklist constant B 1 0 B l-append 2 0 B l-append
+A 3 B 3 rt== 5 check 1 check  3 0 B l-append A 3 B 3 rt!= 5 check 1 check
+0 0 rt-truthy 0 check  3 0 rt-truthy 1 check  0.0 1 rt-truthy 0 check  s" " mkstr 2 rt-truthy 0 check  A 3 rt-truthy 1 check  none rt-truthy 0 check
+B 3 -1 0 rt-index 0 check 3 check   s" hello" mkstr 2 1 0 rt-index 2 check s>al type cr
+99 0 B 3 0 0 rt-setindex  B 3 0 0 rt-index 0 check 99 check
+B 3 1 0 none rt-slice 3 check 3 v>str s>al type cr   s" hello" mkstr 2 -3 0 none rt-slice 2 check s>al type cr  s" hello" mkstr 2 none 2 0 rt-slice 2 check s>al type cr
+2 0 B 3 rt-in 5 check 1 check   7 0 B 3 rt-in 5 check 0 check   s" ell" mkstr 2 s" hello" mkstr 2 rt-in 5 check 1 check
+mkdict constant D  1 0 D s" k" mkstr 2 d-set  s" k" mkstr 2 D 6 rt-in 5 check 1 check  D 6 s" k" mkstr 2 rt-index 0 check 1 check
+: f2 ( a b -- a+b )  2 2 enter  0 ld 1 ld rt+ leave ;
+3 0 4 0 2 f2 0 check 7 check
+: fact ( n -- n! ) 1 1 enter 0 ld 2 0 rt< rt-truthy if 1 0 leave exit then 0 ld 0 ld 1 0 rt- 1 fact rt* leave ;
+10 0 1 fact 0 check 3628800 check   fp @ LS = 1 check
+cr ." ops ok" cr bye

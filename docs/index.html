@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="theme-color" content="#0b0d12"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icon.svg"><link rel="stylesheet" href="ui.css"><title>Forge Agent</title></head>
+<body>
+<header><a class="brand" href="#chat"><img src="icon.svg" alt="" width="28" height="28"><span>Forge Agent</span></a>
+<nav aria-label="Main navigation"><button data-page="chat" aria-current="page">Chat</button><button data-page="forge">Forge</button><button data-page="train">Train</button><button data-page="skills">Skills</button><button data-page="tutorial">Tutorial</button></nav></header>
+<main>
+<section id="screenChat" data-screen="chat" aria-label="Chat">
+  <div class="hero"><h1>What are we building?</h1><p id="chatModel" class="modelLine" role="status"></p></div>
+  <div id="log" aria-live="polite" aria-label="Conversation"></div>
+  <div id="composeArea"><form id="f"><div id="composer"><textarea id="t" rows="1" aria-label="Message" placeholder="Ask your model, or paste text to teach it"></textarea><button type="button" id="upload" aria-label="Upload text files">Upload</button><input type="file" id="chatFiles" multiple hidden accept=".txt,.md,.json,.csv,.yaml,.yml,.js,.py,.log"></div><button id="send" type="submit">Send</button></form>
+  <div id="attachmentList" aria-label="Selected attachments"></div><p id="attachmentStatus" role="status" hidden></p>
+  <div id="chatTools" class="toolbar"></div></div>
+</section>
+<section id="screenForge" data-screen="forge" hidden><div class="pageHead"><h1>Forge</h1><p>Write programs in Forge, the Python-like language built from raw machine code.</p></div><div id="forgePage"></div></section>
+<section id="screenTrain" data-screen="train" hidden><div class="pageHead"><h1>Train</h1><p>Build your own model, give it rules, teach it, and keep the evidence.</p></div><div id="trainPage"></div></section>
+<section id="screenSkills" data-screen="skills" hidden><div class="pageHead"><h1>Skills</h1><p>Markdown files that give your model tools, run in a sandbox after you review them.</p></div><div id="skillsPage"></div></section>
+<section id="screenTutorial" data-screen="tutorial" hidden><div class="pageHead"><h1>Tutorial</h1><p>How the pieces fit together, in order.</p></div><div id="tutorialPage"></div><div id="tutorialMath"></div></section>
+</main>
+<script type="module" src="app.js"></script>
+</body></html>

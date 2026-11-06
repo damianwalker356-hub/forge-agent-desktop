@@ -1,0 +1,206 @@
+{
+  "ranAt": "2026-11-06T21:23:00",
+  "browser": "Chromium headless (Playwright), viewport 390\u00d7844",
+  "results": [
+    {
+      "test": "Create model with owner-chosen hidden size and seed; rules blank",
+      "result": "pass",
+      "detail": {
+        "modelId": "suite-model",
+        "exists": true,
+        "H": 48,
+        "steps": 0,
+        "parameterCount": 27184,
+        "revision": 0,
+        "pending": 0,
+        "examples": 0,
+        "paused": false,
+        "running": false,
+        "autoLearn": true,
+        "rulesBytes": 0,
+        "rulesStateStep": null,
+        "lastReceipt": null,
+        "createdAt": "2026-11-06T21:22:56.441Z",
+        "updatedAt": "2026-11-06T21:22:56.441Z"
+      }
+    },
+    {
+      "test": "Device benchmark reports update and read cost",
+      "result": "pass",
+      "detail": "Hidden size 48 on this device: one weight update \u2248 9 ms; reading text \u2248 0.03 ms per byte; a typical short chat message \u2248 0.0 s of training. Rules of 2,000 bytes add \u2248 0.1 s each time they are re-read."
+    },
+    {
+      "test": "Rules written by owner are applied to the active model",
+      "result": "pass",
+      "detail": "Applied 113 bytes of rules to suite-model (sha256 beff2626b616); rules state computed in 3 ms at update 0. Every answer and every question\u2192answer training pass now starts from this state."
+    },
+    {
+      "test": "Generation is conditioned on the applied rules and changes no weights",
+      "result": "pass",
+      "detail": {
+        "bytes": 113,
+        "stateStep": 0,
+        "recomputed": false
+      }
+    },
+    {
+      "test": "Asking queues the user text, not the model output",
+      "result": "pass",
+      "detail": [
+        {
+          "id": "08c2fc43-b8ff-4b6a-94c0-a0648d4a4a8b",
+          "name": "User message",
+          "kind": "text",
+          "status": "queued",
+          "pass": 0,
+          "passes": 1,
+          "updates": 0,
+          "bytes": 11
+        }
+      ]
+    },
+    {
+      "test": "Correction becomes a question/answer pair for the last question",
+      "result": "pass",
+      "detail": {
+        "id": "8b0ad621-7400-48fd-b84f-10c5f67cbfe0",
+        "name": "User correction",
+        "kind": "pair",
+        "status": "queued",
+        "pass": 0,
+        "passes": 150,
+        "updates": 0,
+        "bytes": 27
+      }
+    },
+    {
+      "test": "Receipt proves a committed weight change",
+      "result": "pass",
+      "detail": {
+        "stepBefore": 1,
+        "stepAfter": 3,
+        "changedParameterAssignments": 29981,
+        "hashBefore": "ecc2057495c65ac37d3460e4ff625e896d12d8b21c8bfa99d5ad692ed93e9161",
+        "hashAfter": "9db6db8a2575b08b678ae84bf1440ff7c4bb483d9ae29a46f7c6a243dbc8ad11",
+        "rules": {
+          "bytes": 113,
+          "stateStep": 0
+        }
+      }
+    },
+    {
+      "test": "Pair training ran with the owner rules in context",
+      "result": "pass",
+      "detail": {
+        "bytes": 113,
+        "stateStep": 8
+      }
+    },
+    {
+      "test": "Rule tests run against the applied rules",
+      "result": "pass",
+      "detail": "1/1 exact at update 10 with 113 bytes of rules.\n\nPASS unit\n  prompt:   Bore unit?\n  expected: \"mm\"\n  actual:   \"mm\"  (byte accuracy 100%)"
+    },
+    {
+      "test": "Sandbox isolation probe passed",
+      "result": "pass",
+      "detail": "Sandbox check passed in this browser (blob-worker; network, storage, page and importScripts all unreachable; 30 ms)."
+    },
+    {
+      "test": "Install refused without code approval",
+      "result": "pass",
+      "detail": "Tick the approval box after reading the code"
+    },
+    {
+      "test": "Skill installed after sandbox tests passed",
+      "result": "pass",
+      "detail": "Installed engine-displacement v1 after 3/3 tests passed (blob-worker). The model does not know the tool exists until you queue its examples below or teach it yourself."
+    },
+    {
+      "test": "Installed tool runs in the sandbox with validated input",
+      "result": "pass",
+      "detail": {
+        "mode": "blob-worker",
+        "result": {
+          "displacement_cc": 1839.6067021993072,
+          "displacement_liters": 1.8396067021993072,
+          "cylinders": 4
+        },
+        "rendered": "Displacement: 1.840 L (1840 cc) from 4 cylinders"
+      }
+    },
+    {
+      "test": "Schema rejects out-of-range tool input",
+      "result": "pass",
+      "detail": "Input rejected: bore_mm must be \u2265 1"
+    },
+    {
+      "test": "Infinite loop in a tool is terminated by timeout",
+      "result": "pass",
+      "detail": "Tool exceeded 800 ms and was terminated"
+    },
+    {
+      "test": "Tool code cannot see storage or the page",
+      "result": "pass",
+      "detail": {
+        "ls": "undefined",
+        "doc": "undefined",
+        "idb": "object",
+        "net": {}
+      }
+    },
+    {
+      "test": "Skill examples queued for the active model as tool-call pairs",
+      "result": "pass",
+      "detail": [
+        "User message",
+        "User correction",
+        "engine-displacement example",
+        "engine-displacement tool call",
+        "engine-displacement tool call"
+      ]
+    },
+    {
+      "test": "Slash command runs an installed tool from Chat",
+      "result": "pass",
+      "detail": "Weights changed and saved \u2014 model suite-model; updates 15 \u2192 17; 64 byte targets; last-window loss 5.3051 \u2192 5.2025; 31,806 changed parameter assignments; hash 34eb7645babd \u2192 383b6ac7ddac. engine-displa"
+    },
+    {
+      "test": "Model-style tool call text parses into a validated call",
+      "result": "pass",
+      "detail": {
+        "name": "engine_displacement",
+        "input": {
+          "bore_mm": 86,
+          "stroke_mm": 86,
+          "cylinders": 4
+        },
+        "raw": "[tool:engine_displacement] {\"bore_mm\":86,\"stroke_mm\":86,\"cylinders\":4}"
+      }
+    },
+    {
+      "test": "Model, rules, learning history and installed skill persist across reload",
+      "result": "pass",
+      "detail": {
+        "steps": 38,
+        "jobs": 6,
+        "skills": [
+          [
+            "engine-displacement",
+            "installed"
+          ]
+        ]
+      }
+    },
+    {
+      "test": "Multiple models: create, switch active, delete",
+      "result": "pass",
+      "detail": "suite-model\nactive\n\nhidden 48 \u00b7 27,184 parameters \u00b7 54 updates \u00b7 6 saved examples \u00b7 rules 113 bytes \u00b7 updated 11/6/2026, 9:22:59 PM\n\nExport\nOpen Chat\nDelete"
+    },
+    {
+      "test": "No uncaught page errors during the suite",
+      "result": "pass",
+      "detail": []
+    }
+  ]
+}

@@ -1,0 +1,202 @@
+\ lex.fg — tokenizer for Forge's Python-like layer (runs on rt.fg).
+\ Token = 32 bytes: [type 8][val 8][aux 8][line 8]
+\ types: 1 NAME(val=sym) 2 INT 3 FLOAT(val=bits) 4 STR(val=s) 5 OP(val=code) 6 NEWLINE 7 INDENT 8 DEDENT 9 EOF
+\ OP codes: single-char ops use their ASCII code; multi-char ops use 1000+ (see op-codes below).
+
+\ ------------------------------------------------------------------ symbols (interned names)
+\ sym = ptr -> [next 8][len 8][gcell 8][func 8][builtin 8][kw 8][slot 8][method 8][name bytes]
+1024 constant SYM-BUCKETS   SYM-BUCKETS 8 * allocate constant SYMTAB
+: sym.len  ( sym -- n ) 8 + @ ;
+: sym.name ( sym -- addr ) 64 + ;
+: sym>al   ( sym -- addr len ) dup sym.name swap sym.len ;
+: sym.gcell   ( sym -- a ) 16 + ;
+: sym.func    ( sym -- a ) 24 + ;
+: sym.builtin ( sym -- a ) 32 + ;
+: sym.kw      ( sym -- a ) 40 + ;
+: sym.slot    ( sym -- a ) 48 + ;
+: sym.method  ( sym -- a ) 56 + ;
+: sym-hash ( addr len -- h ) -3750763034362895579 >r over + swap begin 2dup > while dup c@ r> xor 1099511628211 * >r 1+ repeat 2drop r> ;
+: sym-bucket ( addr len -- a ) sym-hash SYM-BUCKETS 1- and 8 * SYMTAB + ;
+: sym-new ( addr len bucket -- sym ) >r dup 64 + alloc0 dup >r ( addr len sym ) over r@ 8 + ! 64 + swap cmove
+   r> r> ( sym bucket ) dup @ 2 pick ! over swap ! ;
+: intern ( addr len -- sym ) 2dup sym-bucket dup @ ( addr len bucket sym )
+   begin dup while
+      3 pick 3 pick 2 pick sym>al str= if nip nip nip exit then @ repeat
+   drop sym-new ;
+
+\ keyword ids
+: kw! ( id addr len -- ) intern sym.kw ! ;
+1  s" def" kw!       2  s" return" kw!   3  s" if" kw!      4  s" elif" kw!    5  s" else" kw!
+6  s" while" kw!     7  s" for" kw!      8  s" in" kw!      9  s" break" kw!   10 s" continue" kw!
+11 s" pass" kw!      12 s" and" kw!      13 s" or" kw!      14 s" not" kw!     15 s" True" kw!
+16 s" False" kw!     17 s" None" kw!     18 s" global" kw!  19 s" import" kw!  20 s" del" kw!
+21 s" is" kw!        22 s" lambda" kw!   23 s" class" kw!   24 s" from" kw!    25 s" as" kw!
+26 s" try" kw!       27 s" except" kw!   28 s" with" kw!    29 s" yield" kw!   30 s" assert" kw!
+31 s" raise" kw!     32 s" finally" kw!  33 s" nonlocal" kw! 34 s" async" kw!  35 s" await" kw!
+
+\ ------------------------------------------------------------------ token store
+16777216 allocate constant TOKS   variable ntok 0 ntok !
+: tok ( i -- a ) 5 lshift TOKS + ;
+: tok.type ( a -- n ) @ ;      : tok.val ( a -- n ) 8 + @ ;   : tok.aux ( a -- n ) 16 + @ ;   : tok.line ( a -- n ) 24 + @ ;
+variable lx-line
+: emit-tok ( val type -- ) ntok @ tok >r r@ ! r@ 8 + ! 0 r@ 16 + ! lx-line @ r> 24 + ! 1 ntok +! ;
+: last-type ( -- t ) ntok @ 0= if 0 exit then ntok @ 1- tok tok.type ;
+
+\ ------------------------------------------------------------------ scanner state
+variable lx-src variable lx-end variable lx-pos variable lx-depth
+64 array ind-stk  variable ind-sp
+: lx-error ( addr len -- ) lx-line @ cur-line ! s" SyntaxError: " err-type rt-fatal ;
+: lx-c  ( -- c ) lx-pos @ lx-end @ < if lx-pos @ c@ else 0 then ;
+: lx-c1 ( -- c ) lx-pos @ 1+ lx-end @ < if lx-pos @ 1+ c@ else 0 then ;
+: lx-c2 ( -- c ) lx-pos @ 2 + lx-end @ < if lx-pos @ 2 + c@ else 0 then ;
+: lx-adv ( -- ) 1 lx-pos +! ;
+: digit? ( c -- f ) [char] 0 [char] 9 1+ within ;
+: alpha? ( c -- f ) dup [char] a [char] z 1+ within over [char] A [char] Z 1+ within or swap [char] _ = or ;
+: alnum? ( c -- f ) dup alpha? swap digit? or ;
+: hexval ( c -- n ) dup digit? if [char] 0 - exit then 32 or [char] a - 10 + ;
+
+\ ------------------------------------------------------------------ names
+: lx-name ( -- ) lx-pos @ begin lx-c alnum? while lx-adv repeat
+   lx-pos @ over - intern 1 emit-tok ;
+
+\ ------------------------------------------------------------------ numbers
+variable nm-mant variable nm-exp variable nm-digits variable nm-float variable nm-n variable nm-dropped
+2048 allocate constant NM-BUF   \ all significant digits of the literal (for correctly rounded float parsing)
+: nm-digit ( c -- ) [char] 0 - dup 0= nm-mant @ 0= and if drop exit then
+   nm-n @ 2000 < if dup [char] 0 + NM-BUF nm-n @ + c! 1 nm-n +! then
+   nm-digits @ 18 < if nm-mant @ 10 * + nm-mant ! 1 nm-digits +! else drop 1 nm-exp +! 1 nm-dropped +! then ;
+: nm-int-digits ( -- ) begin lx-c digit? lx-c [char] _ = or while lx-c digit? if lx-c nm-digit then lx-adv repeat ;
+: lx-hex ( -- ) lx-adv lx-adv 0 begin lx-c dup alnum? while lx-adv [char] _ over = if drop else hexval swap 4 lshift + then repeat drop 2 emit-tok ;
+: nm-exponent ( -- ) lx-adv lx-c [char] - = if -1 lx-adv else 1 lx-c [char] + = if lx-adv then then
+   lx-c digit? 0= if s" malformed float exponent" lx-error then
+   0 begin lx-c digit? while 10 * lx-c [char] 0 - + lx-adv repeat * nm-exp +! ;
+: nm-scale ( f e -- f' ) dup 0= if drop exit then
+   dup -300 < if >r 300 10^ f/ r> 300 + recurse exit then  dup 300 > if >r 300 10^ f* r> 300 - recurse exit then
+   dup 0 < if negate 10^ f/ else 10^ f* then ;
+: nm-value ( -- f ) nm-n @ 0= if 0.0 exit then NM-BUF nm-n @ nm-exp @ nm-dropped @ - decimal>f ;
+: lx-number ( -- )
+   lx-c [char] 0 = lx-c1 dup [char] x = swap [char] X = or and if lx-hex exit then
+   0 nm-mant ! 0 nm-exp ! 0 nm-digits ! 0 nm-float ! 0 nm-n ! 0 nm-dropped !
+   nm-int-digits
+   lx-c [char] . = if 1 nm-float ! lx-adv begin lx-c digit? lx-c [char] _ = or while lx-c digit? if lx-c nm-digit -1 nm-exp +! then lx-adv repeat then
+   lx-c dup [char] e = swap [char] E = or if 1 nm-float ! nm-exponent then
+   nm-float @ if nm-value 3 emit-tok else
+      nm-exp @ 0 > if s" integer literal too large" lx-error then nm-mant @ 2 emit-tok then ;
+
+\ ------------------------------------------------------------------ strings
+: esc-char ( c -- c' ) case [char] n of 10 endof [char] t of 9 endof [char] r of 13 endof [char] 0 of 0 endof
+   [char] a of 7 endof [char] b of 8 endof [char] f of 12 endof [char] v of 11 endof dup endcase ;
+variable str-q variable str-tri
+: tri-open?  ( -- f ) lx-c str-q @ = lx-c1 str-q @ = and ;
+: tri-close? ( -- f ) lx-c1 str-q @ = lx-c2 str-q @ = and ;
+: lx-string ( -- )
+   lx-c str-q ! lx-adv  tri-open? str-tri !  str-tri @ if lx-adv lx-adv then
+   lx-end @ lx-pos @ - sbuf >r
+   begin
+      lx-c 0= if s" unterminated string literal" lx-error then
+      lx-c str-q @ = if str-tri @ 0= tri-close? or if
+         str-tri @ if lx-adv lx-adv then lx-adv r> sbuf> 4 emit-tok exit then then
+      lx-c 10 = if str-tri @ 0= if s" unterminated string literal" lx-error then 1 lx-line +! then
+      lx-c 92 = if lx-adv
+         lx-c 10 = if 1 lx-line +! lx-adv
+         else lx-c [char] x = if lx-adv lx-c hexval 4 lshift lx-adv lx-c hexval + lx-adv put-char
+         else lx-c esc-char put-char lx-adv then then
+      else lx-c put-char lx-adv then
+   again ;
+
+\ ------------------------------------------------------------------ operators
+1000 constant OP==  1001 constant OP!=  1002 constant OP<=  1003 constant OP>=  1004 constant OP//
+1005 constant OP**  1006 constant OP+=  1007 constant OP-=  1008 constant OP*=  1009 constant OP/=
+1010 constant OP//= 1011 constant OP%=  1012 constant OP**= 1013 constant OP->  1014 constant OP<<  1015 constant OP>>
+: op3? ( -- code|0 ) lx-c [char] / = lx-c1 [char] / = and lx-c2 [char] = = and if OP//= exit then
+   lx-c [char] * = lx-c1 [char] * = and lx-c2 [char] = = and if OP**= exit then 0 ;
+: op2? ( -- code|0 ) lx-c1 [char] = = if
+      lx-c case [char] = of OP== endof [char] ! of OP!= endof [char] < of OP<= endof [char] > of OP>= endof
+         [char] + of OP+= endof [char] - of OP-= endof [char] * of OP*= endof [char] / of OP/= endof [char] % of OP%= endof
+         drop 0 0 endcase exit then
+   lx-c [char] / = lx-c1 [char] / = and if OP// exit then
+   lx-c [char] * = lx-c1 [char] * = and if OP** exit then
+   lx-c [char] - = lx-c1 [char] > = and if OP-> exit then
+   lx-c [char] < = lx-c1 [char] < = and if OP<< exit then
+   lx-c [char] > = lx-c1 [char] > = and if OP>> exit then 0 ;
+: op1? ( c -- f ) >r s" ()[]{},:.+-*/%<>=;&|^~@" over + swap begin 2dup > while dup c@ r@ = if 2drop r> drop 1 exit then 1+ repeat 2drop r> drop 0 ;
+: lx-op ( -- )
+   op3? ?dup if 5 emit-tok lx-adv lx-adv lx-adv exit then
+   op2? ?dup if 5 emit-tok lx-adv lx-adv exit then
+   lx-c op1? 0= if s" invalid character" lx-error then
+   lx-c dup case [char] ( of 1 lx-depth +! endof [char] [ of 1 lx-depth +! endof [char] { of 1 lx-depth +! endof
+      [char] ) of -1 lx-depth +! endof [char] ] of -1 lx-depth +! endof [char] } of -1 lx-depth +! endof endcase
+   5 emit-tok lx-adv ;
+
+\ ------------------------------------------------------------------ lines and indentation
+: skip-blank ( -- ) begin lx-c dup 32 = swap 9 = or while lx-adv repeat ;
+: skip-comment ( -- ) begin lx-c dup 0<> swap 10 <> and while lx-adv repeat ;
+: measure-indent ( -- n ) 0 begin lx-c 32 = if 1+ lx-adv else lx-c 9 = if 8 + -8 and lx-adv else exit then then again ;
+: emit-dedents ( n -- ) \ pop indent stack until it equals n
+   begin dup ind-sp @ cells ind-stk + @ < while -1 ind-sp +! 0 8 emit-tok repeat
+   dup ind-sp @ cells ind-stk + @ <> if s" unindent does not match any outer indentation level" lx-error then drop ;
+: handle-indent ( n -- )
+   dup ind-sp @ cells ind-stk + @ > if 1 ind-sp +! ind-sp @ cells ind-stk + ! 0 7 emit-tok exit then
+   emit-dedents ;
+: lx-newline ( -- ) lx-depth @ 0= if last-type 6 <> last-type 0<> and if 0 6 emit-tok then then 1 lx-line +! lx-adv ;
+: lx-line-start ( -- ) \ at the beginning of a physical line
+   measure-indent
+   lx-c [char] # = if skip-comment then
+   lx-c 10 = lx-c 0= or if drop exit then      \ blank line: ignore
+   lx-depth @ 0= if handle-indent else drop then ;
+\ ------------------------------------------------------------------ f-strings
+\ f"a{x:spec}b" is lexed as the token stream of  ("" + "a" + __fmt(x, "spec") + "b")
+4096 allocate constant FS-BUF  variable fs-n
+: fs-put ( c -- ) FS-BUF fs-n @ + c! 1 fs-n +! ;
+: fs-flush ( -- ) fs-n @ 0= if exit then [char] + 5 emit-tok FS-BUF fs-n @ mkstr 4 emit-tok 0 fs-n ! ;
+: fx-end ( -- addr )  \ from lx-pos (just after '{'): address of the '}' or top-level ':' that ends the expression
+   lx-pos @ 0 begin over lx-end @ < while
+      over c@ dup [char] " = over [char] ' = or if >r swap 1+ begin dup c@ r@ <> while 1+ repeat swap r> drop else
+      dup [char] ( = over [char] [ = or over [char] { = or if drop 1+ else
+      dup [char] ) = over [char] ] = or if drop 1- else
+      dup [char] } = over [char] : = or 2 pick 0= and if drop drop exit else drop then then then then
+      swap 1+ swap repeat
+   s" unterminated expression in f-string" lx-error ;
+variable 'lx-token   : lx-token ( -- ) 'lx-token @ execute ;
+: lx-fexpr ( -- )  \ at '{'
+   lx-adv fx-end lx-end @ >r str-q @ >r dup lx-end !
+   [char] + 5 emit-tok s" __fmt" intern 1 emit-tok [char] ( 5 emit-tok
+   begin skip-blank lx-pos @ lx-end @ < while lx-token repeat
+   r> str-q ! r> lx-end ! lx-pos ! [char] , 5 emit-tok
+   lx-c [char] : = if lx-adv lx-pos @ begin lx-c [char] } <> lx-c 0<> and while lx-adv repeat lx-pos @ over - mkstr 4 emit-tok
+   else s" " mkstr 4 emit-tok then
+   lx-c [char] } <> if s" expected '}' in f-string" lx-error then lx-adv [char] ) 5 emit-tok ;
+: lx-fstring ( -- )  \ at the quote after f / F
+   lx-c str-q ! lx-adv 0 fs-n !
+   [char] ( 5 emit-tok s" " mkstr 4 emit-tok
+   begin
+      lx-c 0= lx-c 10 = or if s" unterminated f-string" lx-error then
+      lx-c str-q @ = if lx-adv fs-flush [char] ) 5 emit-tok exit then
+      lx-c [char] { = if lx-c1 [char] { = if [char] { fs-put lx-adv lx-adv else fs-flush lx-fexpr then else
+      lx-c [char] } = if [char] } fs-put lx-adv lx-c [char] } = if lx-adv then else
+      lx-c 92 = if lx-adv lx-c esc-char fs-put lx-adv else lx-c fs-put lx-adv then then then
+   again ;
+: (lx-token) ( -- )
+   lx-c dup [char] f = over [char] F = or lx-c1 [char] " = lx-c1 [char] ' = or and if drop lx-adv lx-fstring exit then
+   dup alpha? if drop lx-name exit then
+   dup digit? if drop lx-number exit then
+   dup [char] . = lx-c1 digit? and if drop lx-number exit then
+   dup [char] " = over [char] ' = or if drop lx-string exit then
+   dup [char] # = if drop skip-comment exit then
+   dup 92 = lx-c1 10 = and if drop lx-adv lx-adv 1 lx-line +! exit then
+   dup 13 = if drop lx-adv exit then
+   drop lx-op ;
+' (lx-token) 'lx-token !
+: lex-source ( addr len -- )
+   over + lx-end ! dup lx-pos ! lx-src ! 1 lx-line ! 0 lx-depth ! 0 ntok ! 0 ind-sp ! 0 ind-stk !
+   begin lx-pos @ lx-end @ < while
+      lx-line-start
+      begin lx-c dup 0<> swap 10 <> and while skip-blank lx-c 10 = lx-c 0= or if else lx-token then repeat
+      lx-c 10 = if lx-newline then
+   repeat
+   last-type 6 <> last-type 0<> and if 0 6 emit-tok then
+   0 emit-dedents 0 9 emit-tok ;
+
+\ ------------------------------------------------------------------ file loading
+: read-whole-file ( zaddr -- addr len ) 0 0 open-file dup 0 < if drop s" cannot open file" lx-error then >r
+   67108864 allocate dup r@ swap 67108864 read-file ( addr n ) r> close-file ;

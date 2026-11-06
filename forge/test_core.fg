@@ -1,0 +1,39 @@
+\ test_core.fg — exercises core.fg. Every line prints a value followed by the expected value.
+: check ( got expected -- ) 2dup = if 2drop ." ok   " else ." FAIL " swap (.) ."  expected " (.) cr abort then ;
+5 3 nip 3 check
+1 2 tuck drop drop 2 check
+1 2 3 -rot + + 6 check
+1 2 3 2 pick 1 check 2drop drop
+depth 0 check
+-7 abs 7 check   3 9 min 3 check   3 9 max 9 check
+17 5 /mod 3 check 2 check
+100 7 3 */ 233 check
+5 0 10 within 1 check   15 0 10 within 0 check
+3 sq 9 check
+variable v  5 v !  3 v +!  v @ 8 check
+create buf 16 allot   buf 16 255 fill  buf 7 + c@ 255 check  buf 16 erase buf 7 + c@ 0 check
+4096 allocate dup 0 > 1 check  dup 100 + 77 swap c!  dup 100 + c@ 77 check  4096 free
+s" hello" s" hello" str= 1 check   s" hello" s" help!" str= 0 check   s" ab" s" abc" str= 0 check
+z" zstr" zcount 4 check drop
+: zt z" compiled" ; zt zlen 8 check
+42 constant answer  answer 42 check
+3 array arr  10 arr !  20 arr 1 cells + !  arr 1 cells + @ 20 check
+: sel case 1 of 100 endof 2 of 200 endof 999 swap endcase ;
+1 sel 100 check  2 sel 200 check  7 sel 999 check
+: fact dup 1 > if dup 1- recurse * then ;  5 fact 120 check
+: c1 [char] A ;  c1 65 check
+: pp postpone dup ; immediate  : pt 7 pp * ;  pt 49 check
+2.5 fnegate -2.5 f= 1 check    -2.5 fabs 2.5 f= 1 check
+3.7 floor 3.0 f= 1 check   -3.2 floor -4.0 f= 1 check
+2.0 10.0 f** fround 1024 check
+1.5 2.5 fmin 1.5 f= 1 check  1.5 2.5 fmax 2.5 f= 1 check
+180.0 deg>rad pi f= 1 check
+9 ndigits 1 check  -123 ndigits 4 check  0 ndigits 1 check
+argc 3 check
+cr ." sample float output: " 3.14159 f. -0.5 f. 1234.5678 f. 100.0 f. 0.000001 f. cr
+." right-aligned: [" 42 6 .r ." ] [" -7 4 .r ." ]" cr
+." hex: " 255 hex. 0xDEADBEEF hex. cr
+.s 1 2 3 .s 2drop drop
+now-ns 0 > 1 check
+." all core tests passed" cr
+bye

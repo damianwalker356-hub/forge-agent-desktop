@@ -1,0 +1,77 @@
+# hex0 — stage 0 of the Forge bootstrap. A hex-to-binary loader written as raw x86-64 machine code.
+# Reads text on stdin, ignores everything except hex digit pairs, '#' / ';' start a comment to end of line,
+# writes the bytes to stdout. This file is turned into an executable by typing the bytes (see build.sh);
+# nothing else in the chain is ever produced by a pre-made compiler or assembler.
+#
+# ---- ELF64 header (64 bytes) ----
+7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00   ; magic, 64-bit, little-endian, version 1, System V
+02 00 3e 00 01 00 00 00                           ; e_type EXEC, e_machine x86-64, e_version 1
+78 00 40 00 00 00 00 00                           ; e_entry 0x400078 (directly after the headers)
+40 00 00 00 00 00 00 00                           ; e_phoff 64
+00 00 00 00 00 00 00 00                           ; e_shoff 0 (no sections)
+00 00 00 00                                       ; e_flags
+40 00 38 00 01 00 00 00 00 00 00 00               ; ehsize 64, phentsize 56, phnum 1, no section headers
+# ---- program header (56 bytes): one RWX segment covering the whole file ----
+01 00 00 00 07 00 00 00                           ; PT_LOAD, flags R|W|X
+00 00 00 00 00 00 00 00                           ; p_offset 0
+00 00 40 00 00 00 00 00                           ; p_vaddr 0x400000
+00 00 40 00 00 00 00 00                           ; p_paddr
+ff 00 00 00 00 00 00 00                           ; p_filesz 255 (exact file size)
+ff 00 00 00 00 00 00 00                           ; p_memsz 255
+00 10 00 00 00 00 00 00                           ; p_align 4096
+# ---- code (offsets below are relative to the entry point) ----
+# r12 = "high nibble pending" flag, r13 = pending nibble, r14 = "inside comment" flag
+4d 31 e4            ; 00 xor r12,r12
+4d 31 f6            ; 03 xor r14,r14
+# loop:
+31 c0               ; 06 xor eax,eax          SYS_read
+31 ff               ; 08 xor edi,edi          fd 0
+48 89 e6            ; 0a mov rsi,rsp          1-byte buffer at [rsp]
+ba 01 00 00 00      ; 0d mov edx,1
+0f 05               ; 12 syscall
+48 85 c0            ; 14 test rax,rax
+7e 65               ; 17 jle exit             (0 = end of input, <0 = error)
+0f b6 04 24         ; 19 movzx eax,byte [rsp]
+4d 85 f6            ; 1d test r14,r14
+74 09               ; 20 jz notcomment
+3c 0a               ; 22 cmp al,0x0a          newline ends a comment
+75 e0               ; 24 jne loop
+4d 31 f6            ; 26 xor r14,r14
+eb db               ; 29 jmp loop
+# notcomment:
+3c 23               ; 2b cmp al,'#'
+74 4a               ; 2d je setcomment
+3c 3b               ; 2f cmp al,';'
+74 46               ; 31 je setcomment
+8d 48 d0            ; 33 lea ecx,[rax-0x30]   '0'..'9' -> 0..9
+83 f9 09            ; 36 cmp ecx,9
+76 0d               ; 39 jbe digit
+0c 20               ; 3b or al,0x20           fold to lower case
+8d 48 9f            ; 3d lea ecx,[rax-0x61]   'a'..'f' -> 0..5
+83 f9 05            ; 40 cmp ecx,5
+77 c1               ; 43 ja loop              anything else is ignored
+83 c1 0a            ; 45 add ecx,10
+# digit:
+4d 85 e4            ; 48 test r12,r12
+75 08               ; 4b jnz second
+41 89 cd            ; 4d mov r13d,ecx         remember high nibble
+49 ff c4            ; 50 inc r12
+eb b1               ; 53 jmp loop
+# second:
+41 c1 e5 04         ; 55 shl r13d,4
+41 09 cd            ; 59 or r13d,ecx
+44 88 2c 24         ; 5c mov [rsp],r13b
+b8 01 00 00 00      ; 60 mov eax,1            SYS_write
+bf 01 00 00 00      ; 65 mov edi,1            fd 1
+48 89 e6            ; 6a mov rsi,rsp
+ba 01 00 00 00      ; 6d mov edx,1
+0f 05               ; 72 syscall
+4d 31 e4            ; 74 xor r12,r12
+eb 8d               ; 77 jmp loop
+# setcomment:
+49 ff c6            ; 79 inc r14
+eb 88               ; 7c jmp loop
+# exit:
+b8 3c 00 00 00      ; 7e mov eax,60           SYS_exit
+31 ff               ; 83 xor edi,edi
+0f 05               ; 85 syscall

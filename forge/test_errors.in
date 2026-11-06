@@ -1,0 +1,10 @@
+: half-built 1 2 bogus ;
+half-built
+1 2 3 + + . cr
+: ok-after 42 ;
+ok-after . cr
+drop
+." still alive" cr
+do
+5 3 - . cr
+bye

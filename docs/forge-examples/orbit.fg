@@ -1,0 +1,26 @@
+\ orbit.fg — two-body orbit integrated with symplectic (semi-implicit) Euler.
+\ Units: G*M = 1.  Prints position every 1000 steps and the relative energy drift,
+\ which stays bounded for a symplectic integrator (it would grow with explicit Euler).
+\ Run:  ./forge core.fg examples/orbit.fg
+
+variable x   variable y   variable vx   variable vy
+1.0 x !   0.0 y !   0.0 vx !   1.1 vy !          \ slightly eccentric orbit
+0.001 constant dt
+
+: r2      ( -- r^2 )   x @ fsquare y @ fsquare f+ ;
+: energy  ( -- E )     vx @ fsquare vy @ fsquare f+ 0.5 f*  1.0 r2 fsqrt f/ f- ;
+: accel   ( -- ax ay ) r2 dup fsqrt f* 1.0 swap f/ fnegate  dup x @ f* swap y @ f* ;
+: step    ( -- )
+    accel  dt f* vy @ f+ vy !   dt f* vx @ f+ vx !     \ kick: v += a dt
+    vx @ dt f* x @ f+ x !   vy @ dt f* y @ f+ y ! ;     \ drift: x += v dt
+
+energy constant E0
+: report ( step -- )
+    6 .r ."   x=" x @ f. ."  y=" y @ f. ."  v=" vx @ fsquare vy @ fsquare f+ fsqrt f.
+    ."  dE/E=" energy E0 f- E0 f/ fabs f. cr ;
+
+." symplectic Euler two-body orbit, dt=" dt f. cr
+0 report
+: run  10 1 do  1000 0 do step loop  i 1000 * report  loop ;
+run
+bye

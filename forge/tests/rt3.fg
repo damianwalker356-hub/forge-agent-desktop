@@ -1,0 +1,12 @@
+: p ( s -- ) s>al type cr ;
+12345 int>str p  -7 int>str p  0 int>str p
+3.14159 float>str p   2.675 float>str p   0.1 0.2 f+ float>str p  100.0 float>str p  -0.5 float>str p  1.0 3.0 f/ float>str p
+123456789.125 float>str p   0.00001 float>str p  1.5 10000000000.0 f* 10000000000.0 f* float>str p  1.0 3.0 f/ 1000000.0 f/ float>str p  1.0 0.0 f/ float>str p 0.0 float>str p
+2.0 fsqrt float>str p  1000000.0 float>str p   0.001 float>str p   1.0 0.0 f/ fnegate float>str p 
+s" it's" mkstr s-quote p   s" plain" mkstr s-quote p   s" a\b" mkstr s-quote p
+3 mklist constant L   1 0 L l-append  s" two" mkstr 2 L l-append  2.5 1 L l-append  1 5 L l-append  none L l-append
+L 3 v>str p
+mkdict constant D  L 3 D s" k" mkstr 2 d-set  7 0 D 1 0 d-set  D 6 v>str p
+1 0  s" x" mkstr 2  2.0 1  L 3  4 rt-print
+0 rt-print
+cr ." fmt ok" cr bye

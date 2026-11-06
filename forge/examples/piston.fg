@@ -1,0 +1,40 @@
+\ piston.fg — slider-crank kinematics and polytropic compression for one cylinder.
+\ Exact geometry (no small-angle approximation):  x(th) = r cos th + sqrt(l^2 - r^2 sin^2 th)
+\ Run:  ./forge core.fg examples/piston.fg
+
+86.0  constant bore      \ mm
+86.0  constant stroke    \ mm
+143.5 constant rod       \ mm  (centre to centre)
+7000.0 constant rpm
+11.0  constant ratio       \ compression ratio
+stroke 2.0 f/ constant crank
+rpm 2.0 f* pi f* 60.0 f/ constant omega              \ rad/s
+
+variable th                                           \ crank angle, radians (0 = TDC)
+: rsin   ( -- )  crank th @ fsin f* ;
+: rcos   ( -- )  crank th @ fcos f* ;
+: root   ( -- )  rod fsquare rsin fsquare f- fsqrt ;
+: xpos   ( -- mm )   rcos root f+ ;                  \ piston pin distance from crank centre
+: travel ( -- mm )   crank rod f+ xpos f- ;          \ distance down from TDC
+: dxdth  ( -- )  rsin fnegate  rsin rcos f* root f/  f- ;
+: vel    ( -- m/s )  omega dxdth f* 1000.0 f/ ;
+
+\ volumes (cc) and polytropic pressure (bar) during the compression stroke
+bore fsquare pi f* 4.0 f/ stroke f* 1000.0 f/ constant vd       \ displacement per cylinder, cc
+vd ratio 1.0 f- f/ constant vc                                      \ clearance volume, cc
+: volume ( -- cc )  vc bore fsquare pi f* 4.0 f/ travel f* 1000.0 f/ f+ ;
+: pressure ( -- bar )  vd vc f+ volume f/ 1.3 f** ;              \ 1 bar at BDC, n = 1.3
+
+: set-deg ( deg -- )  s>f deg>rad th ! ;
+." bore " bore f.3 ." stroke " stroke f.3 ." rod " rod f.3 ." mm   displacement " vd f.3 ." cc   Vc " vc f.3 ." cc" cr
+." mean piston speed at " rpm f.3 ." rpm: " stroke 2.0 f* rpm f* 60.0 f/ 1000.0 f/ f.3 ." m/s" cr cr
+."   deg   travel_mm     vel_m/s   volume_cc   p_bar" cr
+: row ( deg -- )  dup set-deg 5 .r  6 spaces travel f.3  6 spaces vel f.3  5 spaces volume f.3  3 spaces pressure f.3 cr ;
+: table  390 180 do i row 30 +loop ;
+table
+cr ." peak piston speed (1-degree scan): "
+variable vmax  0.0 vmax !   variable vmax-deg
+: scan  360 0 do  i set-deg vel fabs dup vmax @ f> if vmax ! i vmax-deg ! else drop then  loop ;
+scan  vmax @ f.3 ." m/s at " vmax-deg @ . ." deg ATDC" cr
+." peak compression pressure: " 360 set-deg pressure f.3 ." bar (ideal, n=1.3, no heat loss)" cr
+bye

@@ -1,0 +1,13 @@
+: check ( got expected -- ) 2dup = if 2drop ." ok " else ." FAIL " swap (.) ."  expected " (.) cr abort then ;
+mkdict constant D
+7 0 D s" a" mkstr 2 d-set   D s" a" mkstr 2 d-get 1 check 0 check 7 check
+D s" b" mkstr 2 d-get 0 check 2drop
+D d-count 1 check
+: fill-d 100 0 begin 2dup > while dup 10 * 0 D 3 pick 0 d-set 1+ repeat 2drop ;
+fill-d  D d-count 101 check  D d.cap 256 check
+D 42 0 d-get 1 check 0 check 420 check   D s" a" mkstr 2 d-get 1 check 0 check 7 check  D 100 0 d-get 0 check 2drop
+D 42 0 d-del 1 check  D 42 0 d-get 0 check 2drop  D d-count 100 check  D 42 0 d-del 0 check
+99 0 D 42 0 d-set D 42 0 d-get 1 check 0 check 99 check D d-count 101 check
+D 1.0 1 d-get 1 check 0 check 10 check    D 1 5 d-get 1 check 0 check 10 check
+D 0 d-next swap . . cr
+cr ." dict ok" cr bye

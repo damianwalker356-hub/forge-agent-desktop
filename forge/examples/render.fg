@@ -1,0 +1,103 @@
+\ render.fg — ray tracer: lit sphere with Phong highlight over a checkerboard floor, with a shadow.
+\ Writes a 256x256 binary PPM (P6) to render.ppm using heap memory and raw Linux file syscalls.
+\ Run:  ./forge core.fg examples/render.fg      then view render.ppm (or convert to PNG)
+
+256 constant W   256 constant H
+W H * 3 * constant NBYTES
+NBYTES allocate constant buf                      \ framebuffer: fresh zeroed pages from mmap
+
+\ ---- scene state (all floats in variables; the stack carries scalars) ----
+variable ox variable oy variable oz               \ ray origin
+variable dx variable dy variable dz               \ ray direction (unit)
+variable hx variable hy variable hz               \ hit point
+variable nx variable ny variable nz               \ surface normal
+variable red variable grn variable blu               \ working colour
+0.57735 constant lx   0.57735 constant ly   0.57735 constant lz     \ light direction (unit)
+0.0 constant sx   0.0 constant sy   -3.0 constant sz   1.0 constant sr   \ sphere
+-1.0 constant floor-y
+
+: fdot ( ax ay az bx by bz -- f )   >r >r >r  rot r> f*  rot r> f*  rot r> f*  f+ f+ ;
+: dir  ( -- x y z )  dx @ dy @ dz @ ;
+: org  ( -- x y z )  ox @ oy @ oz @ ;
+: normalize ( -- )
+  dir dir fdot fsqrt
+  dup dx @ swap f/ dx !   dup dy @ swap f/ dy !   dz @ swap f/ dz ! ;
+
+\ nearest positive sphere intersection along the current ray, or -1.0
+: hit-sphere ( -- t )
+  ox @ sx f-  oy @ sy f-  oz @ sz f-  dir fdot                                     \ b = oc . d
+  ox @ sx f-  oy @ sy f-  oz @ sz f-  ox @ sx f-  oy @ sy f-  oz @ sz f-  fdot     \ oc . oc
+  sr sr f* f-                                                                     \ c = oc.oc - r^2
+  over fsquare swap f-                                                            \ b disc
+  dup 0.0 f< if 2drop -1.0 exit then
+  fsqrt swap fnegate swap f-                                                      \ t = -b - sqrt(disc)
+  dup 0.001 f< if drop -1.0 then ;
+
+: hit-floor ( -- t )
+  dy @ -0.000001 f> if -1.0 exit then
+  floor-y oy @ f- dy @ f/ ;
+
+: at ( t -- )  \ hit point = origin + t * dir
+  dup dx @ f* ox @ f+ hx !   dup dy @ f* oy @ f+ hy !   dz @ f* oz @ f+ hz ! ;
+
+: in-shadow? ( -- flag )  \ from the hit point towards the light
+  hx @ lx 0.001 f* f+ ox !  hy @ ly 0.001 f* f+ oy !  hz @ lz 0.001 f* f+ oz !
+  lx dx ! ly dy ! lz dz !
+  hit-sphere 0.0 f> ;
+
+: clamp01 ( f -- f )  0.0 fmax 1.0 fmin ;
+: scale ( k -- )  dup red @ f* red !  dup grn @ f* grn !  blu @ f* blu ! ;
+
+: shade-sphere ( t -- )
+  at   hx @ sx f- nx !  hy @ sy f- ny !  hz @ sz f- nz !            \ unit normal (r = 1)
+  nx @ ny @ nz @ lx ly lz fdot 0.0 fmax                               \ diffuse
+  \ Phong: r = 2(n.l)n - l ; spec = max(r . -d, 0)^32
+  dup 2.0 f* dup nx @ f* lx f-  over ny @ f* ly f-  rot nz @ f* lz f-
+  dx @ fnegate dy @ fnegate dz @ fnegate fdot 0.0 fmax
+  fsquare fsquare fsquare fsquare fsquare                              \ ^32
+  swap 0.85 f* 0.15 f+                                                \ spec  k
+  dup 0.95 f* red !  dup 0.35 f* grn !  0.25 f* blu !
+  dup red @ f+ red !  dup grn @ f+ grn !  blu @ f+ blu ! ;
+
+: shade-floor ( t -- )
+  at
+  hx @ floor f>s  hz @ floor f>s  + 1 and
+  if 0.85 red ! 0.85 grn ! 0.80 blu ! else 0.20 red ! 0.22 grn ! 0.28 blu ! then
+  in-shadow? if 0.35 scale then ;
+
+: shade-sky ( -- )
+  dy @ 1.0 f+ 0.5 f*                                  \ t in 0..1
+  dup 0.5 f* 1.0 swap f- red !   dup 0.3 f* 1.0 swap f- grn !   drop 1.0 blu ! ;
+
+: trace ( -- )
+  hit-sphere  hit-floor                                  \ ts tf
+  over 0.0 f>  over 0.0 f>  and  if 2dup f< if drop shade-sphere else nip shade-floor then exit then
+  over 0.0 f> if drop shade-sphere exit then
+  dup  0.0 f> if nip  shade-floor  exit then
+  2drop shade-sky ;
+
+: pixel ( i j -- )
+  0.0 ox ! 0.0 oy ! 0.0 oz !
+  s>f 0.5 f+ 128.0 f- fnegate 128.0 f/ dy !
+  s>f 0.5 f+ 128.0 f- 128.0 f/ dx !   -1.0 dz !   normalize
+  trace ;
+
+: put ( f addr -- )  swap clamp01 255.0 f* fround swap c! ;
+: render ( -- )
+  H 0 do  W 0 do
+    i j pixel
+    buf j W * i + 3 * +
+    red @ over put  grn @ over 1+ put  blu @ swap 2 + put
+  loop loop ;
+
+: save ( -- )
+  z" render.ppm" create-file dup 0 < if ." cannot create render.ppm" cr abort then
+  dup s" P6 256 256 255 " write-file drop
+  dup buf NBYTES write-file NBYTES <> if ." short write" cr abort then
+  close-file ;
+
+." rendering 256x256 ... " now-ns
+render
+now-ns swap - 1000000 / . ." ms" cr
+save ." wrote render.ppm (" NBYTES . ." bytes)" cr
+bye

@@ -1,0 +1,1768 @@
+# forge.hex1 — Phase 3: the Forge language engine, written in hex1 assembly (hand-typed x86-64 opcodes).
+#
+# The engine is a subroutine-threaded compiler + interpreter for a Forth-style language.
+#   - Dynamic memory: at startup it mmaps a 64 MB RWX data space at 0x10000000 (dict, stacks, buffers),
+#     and ALLOT/HERE/VARIABLE let programs claim more of it at run time.
+#   - Arbitrary control flow: IF/ELSE/THEN, BEGIN/UNTIL, BEGIN/WHILE/REPEAT, DO/LOOP (+I, UNLOOP),
+#     recursion, EXIT (early return) — all compiled to native machine code.
+#   - FFI: the SYSCALL word issues raw Linux kernel syscalls with 6 register arguments; EXECUTE calls
+#     any code address; @/!/C@/C! read and write raw memory.
+# Register conventions: r13=LATEST (dict head) r12=HERE (data-space pointer) r14=PSP (data stack, grows down)
+#   rbx=CSP (compiler control stack, grows down) rbp=STATE (0=interpret, 1=compile). Primitives only
+#   use rax/rcx/rdx/rsi/rdi/r8-r11, so engine registers survive words and syscalls.
+# Data-space layout (256 MB mmap at 0x10000000):
+#   0x10000000 dict+code+data grows up (to 0x1C000000, 192 MB) | 0x1C000000 PSP top | 0x1C100000 CSP top |
+#   0x1C200000 line buffer (64 KB) | 0x1C210000 token buffer | 0x1C211000 number buffer | 0x1C212000 emit buffer |
+#   0x1C212100 INPTR 0x1C212108 INEND 0x1C212110 TOKLEN 0x1C212118 SSTRPTR 0x1C212120 INFILE 0x1C212128 SRCFILL
+#   0x1C212130 SRCBASE 0x1C212138 SAVEDRSP | 0x1C300000 string area (8 MB) | 0x1D000000 source-file buffer (48 MB).
+#
+# ---- ELF64 header (entry 0x400078) ----
+7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
+02 00 3e 00 01 00 00 00
+78 00 40 00 00 00 00 00
+40 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00
+40 00 38 00 01 00 00 00 00 00 00 00
+01 00 00 00 07 00 00 00
+00 00 00 00 00 00 00 00
+00 00 40 00 00 00 00 00
+00 00 40 00 00 00 00 00
+@ 00 00 00 00                   ; p_filesz (low half from @, high half zero)
+@ 00 00 00 00                   ; p_memsz
+00 10 00 00 00 00 00 00
+# ---- code ----
+# ---- variables (cells in the data space) ----
+#   INPTR 0x1C212100  INEND 0x1C212108  TOKLEN 0x1C212110  SSTRPTR 0x1C212118  INFILE 0x1C212120
+#   SRCFILL 0x1C212128  SRCBASE 0x1C212130  REPLRSP 0x1C212138  ARGI 0x1C212140  ENTRYRSP 0x1C212148
+:start
+b8 09 00 00 00                  # mov eax,9 (mmap)
+bf 00 00 00 10                  # mov edi,0x10000000 (fixed address)
+be 00 00 00 10                  # mov esi,0x10000000 (256 MB)
+ba 07 00 00 00                  # mov edx,7 (PROT_READ|WRITE|EXEC)
+41 ba 32 00 00 00               # mov r10d,0x32 (PRIVATE|FIXED|ANONYMOUS)
+49 c7 c0 ff ff ff ff            # mov r8,-1
+45 31 c9                        # xor r9d,r9d
+0f 05                           # syscall
+48 3d 00 00 00 10               # cmp rax,0x10000000
+0f 85 %mmfail                   # jne mmfail
+4d 31 ed                        # xor r13,r13            LATEST=0
+49 c7 c4 00 00 00 10            # mov r12,0x10000000     HERE=dict base
+49 c7 c6 00 00 00 1c            # mov r14,0x1C000000     PSP top
+48 c7 c3 00 00 10 1c            # mov rbx,0x1C100000     CSP top
+48 31 ed                        # xor rbp,rbp            STATE=0
+b8 18 21 21 1c                  # SSTRPTR = string area
+b9 00 00 30 1c
+48 89 08
+b8 28 21 21 1c                  # SRCFILL = source-file buffer base
+b9 00 00 00 1d
+48 89 08
+b8 48 21 21 1c                  # ENTRYRSP = rsp (points at argc, argv[])
+48 89 20
+b8 40 21 21 1c                  # ARGI = 0
+48 c7 00 00 00 00 00
+e8 %install                     # build the dictionary
+b8 01 00 00 00                  # write(2,banner,48)  (stderr: stdout is reserved for programs)
+bf 02 00 00 00
+48 8d 35 %banner
+ba 30 00 00 00
+0f 05
+:argloop                        # load each command-line file in order, then fall into the REPL
+b8 40 21 21 1c                  # mov eax,ARGI
+48 8b 08                        # mov rcx,[rax]
+48 ff c1                        # inc rcx
+48 89 08                        # mov [rax],rcx
+b8 48 21 21 1c                  # mov eax,ENTRYRSP
+48 8b 00                        # mov rax,[rax]
+48 8b 10                        # mov rdx,[rax] (argc)
+48 39 d1                        # cmp rcx,rdx
+0f 83 %mainloop                 # jae mainloop (no more files)
+48 8b 7c c8 08                  # mov rdi,[rax+rcx*8+8] (argv[i], NUL-terminated)
+e8 %loadfile
+e9 %argloop
+:mainloop                       # REPL: read a batch of complete lines from stdin, interpret, repeat
+b8 01 00 00 00                  # write(2,"> ",2)
+bf 02 00 00 00
+48 8d 35 %prompt
+ba 02 00 00 00
+0f 05
+4d 31 c0                        # xor r8,r8 (bytes buffered)
+:rdmore
+31 c0                           # read(0, LINEBUF+r8, 65536-r8)
+31 ff
+be 00 00 20 1c
+4c 01 c6                        # add rsi,r8
+ba 00 00 01 00
+4c 29 c2                        # sub rdx,r8
+0f 05
+48 85 c0
+0f 8f %gotdata                  # jg gotdata
+4d 85 c0                        # EOF: nothing buffered -> exit, else interpret what we have
+0f 84 %bye0
+e9 %dointerp
+:gotdata
+49 01 c0                        # add r8,rax
+b8 00 00 20 1c                  # mov eax,LINEBUF
+42 80 7c 00 ff 0a               # cmp byte [rax+r8-1],'\n'  (batch ends on a line boundary?)
+0f 84 %dointerp
+49 81 f8 00 00 01 00            # cmp r8,65536 (buffer full -> interpret anyway)
+0f 82 %rdmore
+:dointerp
+b8 08 21 21 1c                  # INEND = LINEBUF + r8
+b9 00 00 20 1c
+4c 01 c1
+48 89 08
+b8 00 21 21 1c                  # INPTR = LINEBUF
+b9 00 00 20 1c
+48 89 08
+b8 30 21 21 1c                  # SRCBASE = LINEBUF (for line numbers)
+48 89 08
+b8 20 21 21 1c                  # INFILE = 0 (REPL mode: errors recover)
+48 c7 00 00 00 00 00
+b8 38 21 21 1c                  # REPLRSP = rsp (restored after an error)
+48 89 20
+:replcall
+e8 %interpret
+e9 %mainloop
+# ---- interpret: process tokens from INPTR until INEND, then return ----
+:interpret
+:lineloop
+e8 %nexttoken                   # rax = token length
+48 85 c0
+0f 84 %intdone                  # no more tokens -> done
+b9 00 00 21 1c                  # mov ecx,TOKENBUF
+48 83 f8 01                     # cmp rax,1
+0f 85 %notbs
+80 39 5c                        # cmp byte [rcx],'\'  — \ comment: skip rest of line
+0f 85 %notbs
+e8 %skipline
+e9 %lineloop
+:notbs
+48 83 f8 01
+0f 85 %notparen
+80 39 28                        # cmp byte [rcx],'('  — ( comment )
+0f 85 %notparen
+:pskip
+e8 %nexttoken
+48 85 c0
+0f 84 %intdone
+48 83 f8 01
+0f 85 %pskip
+b9 00 00 21 1c                  # mov ecx,TOKENBUF (nexttoken clobbered rcx)
+80 39 29                        # cmp byte [rcx],')'
+0f 85 %pskip
+e9 %lineloop
+:notparen                        # ':' and ';' are ordinary dictionary words (prim_colon / prim_semi)
+e8 %number                      # rax=value, rdx=1 if valid
+48 85 d2
+0f 84 %tryfind
+48 85 ed                        # test rbp,rbp
+0f 84 %pushnum
+e8 %compilelit                  # compiling: emit literal code
+e9 %lineloop
+:pushnum
+49 83 ee 08                     # sub r14,8
+49 89 06                        # mov [r14],rax
+e9 %lineloop
+:tryfind
+e8 %find                        # r15 = entry or 0
+4d 85 ff
+0f 84 %undeferr
+49 8b 4f 10                     # mov rcx,[r15+16]      name length
+48 83 c1 07                     # add rcx,7
+48 83 e1 f8                     # and rcx,-8
+49 8d 54 0f 18                  # lea rdx,[r15+rcx+24] codeptr slot
+48 8b 02                        # mov rax,[rdx]        codeptr
+48 85 ed                        # test rbp,rbp
+0f 84 %chkco
+41 f6 47 08 01                  # test byte [r15+8],1   immediate?
+0f 85 %execword
+e8 %compilecall                 # compiling non-immediate: emit call
+e9 %lineloop
+:chkco
+41 f6 47 08 02                  # test byte [r15+8],2   compile-only flag?
+0f 85 %compileonly
+:execword
+ff d0                           # call rax
+49 81 fe 00 00 00 1c            # cmp r14,PSP top
+0f 87 %underflow                # ja underflow (stack pointer above its base)
+e9 %lineloop
+:intdone
+c3
+# ---- errors: report (with line number), unlink a half-built definition, reset; REPL continues, files abort ----
+:undeferr
+b8 01 00 00 00                  # write(2,emsg,18)
+bf 02 00 00 00
+48 8d 35 %emsg
+ba 12 00 00 00
+0f 05
+b8 10 21 21 1c                  # mov eax,TOKLEN
+48 8b 10                        # mov rdx,[rax] (count)
+b8 01 00 00 00                  # write(2,TOKENBUF,count)
+bf 02 00 00 00
+be 00 00 21 1c
+0f 05
+e9 %errcommon
+:errnoname
+b8 01 00 00 00                  # write(2,emsg2,20)
+bf 02 00 00 00
+48 8d 35 %emsg2
+ba 14 00 00 00
+0f 05
+e9 %errcommon
+:compileonly
+b8 01 00 00 00                  # write(2,emsg4,21)
+bf 02 00 00 00
+48 8d 35 %emsg4
+ba 15 00 00 00
+0f 05
+b8 10 21 21 1c                  # write(2,TOKENBUF,TOKLEN)
+48 8b 10
+b8 01 00 00 00
+bf 02 00 00 00
+be 00 00 21 1c
+0f 05
+e9 %errcommon
+:underflow
+b8 01 00 00 00                  # write(2,emsg5,22)
+bf 02 00 00 00
+48 8d 35 %emsg5
+ba 16 00 00 00
+0f 05
+e9 %errcommon
+:aborterr                       # ABORT word lands here
+b8 01 00 00 00                  # write(2,emsg3,12)
+bf 02 00 00 00
+48 8d 35 %emsg3
+ba 0c 00 00 00
+0f 05
+:errcommon
+b8 01 00 00 00                  # write(2," (line ",7)
+bf 02 00 00 00
+48 8d 35 %elin
+ba 07 00 00 00
+0f 05
+e8 %countlines                  # rax = line number
+e8 %fmtnum                      # rsi = digits, r10 = length
+b8 01 00 00 00
+bf 02 00 00 00
+4c 89 d2
+0f 05
+b8 01 00 00 00                  # write(2,")\n",2)
+bf 02 00 00 00
+48 8d 35 %eclose
+ba 02 00 00 00
+0f 05
+48 85 ed                        # compiling? unlink the half-built definition
+0f 84 %errnodef
+4d 89 ec                        # mov r12,r13 (HERE = start of the entry)
+4d 8b 6d 00                     # mov r13,[r13] (LATEST = link)
+:errnodef
+49 c7 c6 00 00 00 1c            # reset PSP
+48 c7 c3 00 00 10 1c            # reset CSP
+48 31 ed                        # STATE = 0
+b8 20 21 21 1c                  # in a file? -> fatal
+48 83 38 00
+0f 85 %errfatal
+e8 %skipline                    # REPL: skip the rest of the offending line and continue
+b8 38 21 21 1c
+48 8b 20                        # mov rsp,[REPLRSP]
+e9 %replcall
+:errfatal
+b8 3c 00 00 00                  # exit(1)
+bf 01 00 00 00
+0f 05
+:bye0
+b8 3c 00 00 00                  # exit(0)
+31 ff
+0f 05
+:mmfail
+b8 01 00 00 00                  # write(2,mmmsg,18); exit(1)
+bf 02 00 00 00
+48 8d 35 %mmmsg
+ba 12 00 00 00
+0f 05
+b8 3c 00 00 00
+bf 01 00 00 00
+0f 05
+# ---- skipline: advance INPTR past the next newline (or to INEND) ----
+:skipline
+b8 00 21 21 1c
+48 8b 30                        # mov rsi,[INPTR]
+b8 08 21 21 1c
+48 8b 38                        # mov rdi,[INEND]
+:sklp
+48 39 fe
+0f 83 %skdone
+8a 06                           # mov al,[rsi]
+48 ff c6
+3c 0a
+0f 85 %sklp
+:skdone
+b8 00 21 21 1c
+48 89 30
+c3
+# ---- countlines: rax = 1 + number of newlines in [SRCBASE, INPTR) ----
+:countlines
+b8 30 21 21 1c
+48 8b 30                        # mov rsi,[SRCBASE]
+b8 00 21 21 1c
+48 8b 38                        # mov rdi,[INPTR]
+ba 01 00 00 00
+:cllp
+48 39 fe
+0f 83 %cldone
+8a 06
+48 ff c6
+3c 0a
+0f 85 %cllp
+48 ff c2
+e9 %cllp
+:cldone
+48 89 d0
+c3
+# ---- loadfile: rdi = NUL-terminated path. Read the whole file into the source buffer and interpret it. ----
+:loadfile
+b8 02 00 00 00                  # open(path, O_RDONLY, 0)
+31 f6
+31 d2
+0f 05
+48 85 c0
+0f 88 %openfail                 # js openfail
+49 89 c0                        # mov r8,rax (fd)
+b8 00 21 21 1c                  # save the caller's input state
+ff 30                           # push [INPTR]
+b8 08 21 21 1c
+ff 30                           # push [INEND]
+b8 30 21 21 1c
+ff 30                           # push [SRCBASE]
+b8 20 21 21 1c
+ff 30                           # push [INFILE]
+b8 28 21 21 1c
+4c 8b 08                        # mov r9,[SRCFILL] (file text starts here)
+4d 89 ca                        # mov r10,r9 (fill pointer)
+:rdlp
+31 c0                           # read(fd, r10, 0x20000000-r10)
+4c 89 c7
+4c 89 d6
+ba 00 00 00 20
+4c 29 d2
+0f 05
+48 85 c0
+0f 8e %rddone                   # jle rddone (EOF or error)
+49 01 c2                        # add r10,rax
+e9 %rdlp
+:rddone
+b8 03 00 00 00                  # close(fd)
+4c 89 c7
+0f 05
+b8 28 21 21 1c
+4c 89 10                        # SRCFILL = r10
+b8 00 21 21 1c
+4c 89 08                        # INPTR = r9
+b8 30 21 21 1c
+4c 89 08                        # SRCBASE = r9
+b8 08 21 21 1c
+4c 89 10                        # INEND = r10
+b8 20 21 21 1c
+48 c7 00 01 00 00 00            # INFILE = 1 (errors abort)
+e8 %interpret
+b8 20 21 21 1c                  # restore the caller's input state
+8f 00                           # pop [INFILE]
+b8 30 21 21 1c
+8f 00                           # pop [SRCBASE]
+b8 08 21 21 1c
+8f 00                           # pop [INEND]
+b8 00 21 21 1c
+8f 00                           # pop [INPTR]
+c3
+:openfail
+57                              # push rdi (path)
+b8 01 00 00 00                  # write(2,eopen,25)
+bf 02 00 00 00
+48 8d 35 %eopen
+ba 19 00 00 00
+0f 05
+5e                              # pop rsi (path)
+31 d2                           # strlen -> rdx
+:oflp
+80 3c 16 00                     # cmp byte [rsi+rdx],0
+0f 84 %ofdone
+48 ff c2
+e9 %oflp
+:ofdone
+b8 01 00 00 00                  # write(2,path,len)
+bf 02 00 00 00
+0f 05
+b8 01 00 00 00                  # write(2,"\n",1)
+bf 02 00 00 00
+48 8d 35 %enl
+ba 01 00 00 00
+0f 05
+b8 3c 00 00 00                  # exit(1)
+bf 01 00 00 00
+0f 05
+# ---- nexttoken: skip whitespace, copy token to TOKENBUF; rax=len, TOKLEN stored ----
+:nexttoken
+48 31 c9                        # xor rcx,rcx (length)
+b8 00 21 21 1c                  # mov eax,INPTR
+48 8b 30                        # mov rsi,[rax]
+b8 08 21 21 1c                  # mov eax,INEND
+48 8b 38                        # mov rdi,[rax]
+:ntskip
+48 39 fe                        # cmp rsi,rdi
+0f 83 %ntdone                   # jae ntdone
+8a 06                           # mov al,[rsi]
+3c 20                           # cmp al,0x20 (space/tab/nl/cr all count)
+0f 86 %ntskipone
+:ntcollect
+41 b8 00 00 21 1c               # mov r8d,TOKENBUF
+:ntloop
+48 39 fe                        # cmp rsi,rdi
+0f 83 %ntdone
+8a 06                           # mov al,[rsi]
+3c 20
+0f 86 %ntdone                   # jbe ntdone
+48 83 f9 3f                     # cmp rcx,63
+0f 83 %ntskipch                 # jae ntskipch (truncate long tokens)
+41 88 04 08                     # mov [r8+rcx],al
+:ntskipch
+48 ff c6                        # inc rsi
+48 ff c1                        # inc rcx
+e9 %ntloop
+:ntskipone
+48 ff c6                        # inc rsi
+e9 %ntskip
+:ntdone
+b8 00 21 21 1c                  # mov eax,INPTR
+48 89 30                        # mov [rax],rsi
+b8 10 21 21 1c                  # mov eax,TOKLEN
+48 89 08                        # mov [rax],rcx
+48 89 c8                        # mov rax,rcx
+c3
+# ---- number: parse TOKENBUF as signed decimal or 0x hex; rax=value, rdx=1/0 ----
+:number
+b8 10 21 21 1c                  # mov eax,TOKLEN
+48 8b 10                        # mov rdx,[rax]
+48 85 d2
+0f 84 %numbad
+48 31 c0                        # xor rax,rax (value)
+49 c7 c1 01 00 00 00            # mov r9,1 (sign)
+4d 31 d2                        # xor r10,r10 (index)
+41 bb 00 00 21 1c               # mov r11d,TOKENBUF
+4d 31 c0                        # xor r8,r8 (float flag: saw '.')
+48 31 f6                        # xor rsi,rsi (fraction digits)
+48 31 ff                        # xor rdi,rdi (total digits)
+43 8a 0b                        # mov cl,[r11]
+80 f9 2d                        # cmp cl,'-'
+0f 85 %numck
+49 c7 c1 ff ff ff ff            # mov r9,-1
+49 ff c2                        # inc r10
+:numck
+49 39 d2                        # cmp r10,rdx
+0f 83 %numbad                   # jae numbad (no digits)
+43 8a 0c 13                     # mov cl,[r11+r10]
+80 f9 30                        # cmp cl,'0'
+0f 85 %numdec
+43 8a 4c 13 01                  # mov cl,[r11+r10+1]
+80 c9 20                        # or cl,0x20
+80 f9 78                        # cmp cl,'x'
+0f 85 %numdec
+49 83 c2 02                     # add r10,2 (hex prefix)
+e9 %numhex
+:numdec
+:numdeclp
+49 39 d2                        # cmp r10,rdx
+0f 83 %numdecend
+43 8a 0c 13                     # mov cl,[r11+r10]
+80 f9 2e                        # cmp cl,'.'  (decimal point -> float literal)
+0f 85 %numdigit
+4d 85 c0                        # second '.' -> not a number
+0f 85 %numbad
+49 ff c0                        # inc r8 (float flag)
+49 ff c2
+e9 %numdeclp
+:numdigit
+80 f9 30
+0f 82 %numbad                   # jb numbad
+80 f9 39
+0f 87 %numbad                   # ja numbad
+80 e9 30                        # sub cl,0x30
+48 6b c0 0a                     # imul rax,rax,10
+0f b6 c9                        # movzx ecx,cl
+48 01 c8                        # add rax,rcx
+48 ff c7                        # inc rdi (digits)
+4d 85 c0
+0f 84 %numnofrac
+48 ff c6                        # inc rsi (fraction digits)
+:numnofrac
+49 ff c2                        # inc r10
+e9 %numdeclp
+:numdecend
+48 85 ff                        # no digits at all ("." or "-") -> not a number
+0f 84 %numbad
+4d 85 c0
+0f 84 %numok                    # integer
+f2 48 0f 2a c0                  # cvtsi2sd xmm0,rax        (float: mantissa / 10^fracdigits * sign)
+f2 0f 10 0d %fone               # movsd xmm1,[fone]
+f2 0f 10 15 %ften               # movsd xmm2,[ften]
+:numpow
+48 85 f6
+0f 84 %numpowd
+f2 0f 59 ca                     # mulsd xmm1,xmm2
+48 ff ce
+e9 %numpow
+:numpowd
+f2 0f 5e c1                     # divsd xmm0,xmm1
+f2 49 0f 2a c9                  # cvtsi2sd xmm1,r9 (sign)
+f2 0f 59 c1                     # mulsd xmm0,xmm1
+66 48 0f 7e c0                  # movq rax,xmm0
+ba 01 00 00 00                  # mov edx,1
+c3
+:numhex
+:numhexlp
+49 39 d2
+0f 83 %numok
+43 8a 0c 13                     # mov cl,[r11+r10]
+80 f9 30
+0f 82 %numbad
+80 f9 39
+0f 87 %numhexalpha
+80 e9 30                        # sub cl,0x30
+e9 %numhexok
+:numhexalpha
+80 c9 20                        # or cl,0x20 (fold case)
+80 f9 61                        # cmp cl,'a'
+0f 82 %numbad
+80 f9 66                        # cmp cl,'f'
+0f 87 %numbad
+80 e9 57                        # sub cl,0x57
+:numhexok
+48 c1 e0 04                     # shl rax,4
+0f b6 c9                        # movzx ecx,cl
+48 01 c8                        # add rax,rcx
+49 ff c2
+e9 %numhexlp
+:numok
+49 0f af c1                     # imul rax,r9 (apply sign)
+ba 01 00 00 00                  # mov edx,1
+c3
+:numbad
+31 d2                           # xor edx,edx
+c3
+# ---- find: walk dictionary from LATEST; r15 = entry or 0 ----
+:find
+b8 10 21 21 1c                  # mov eax,TOKLEN
+48 8b 08                        # mov rcx,[rax]
+4d 89 ef                        # mov r15,r13
+:findloop
+4d 85 ff                        # test r15,r15
+0f 84 %findno
+49 8b 57 10                     # mov rdx,[r15+16] (name length)
+48 39 ca                        # cmp rdx,rcx
+0f 85 %findnext
+41 b8 00 00 21 1c               # mov r8d,TOKENBUF
+49 8d 77 18                     # lea rsi,[r15+24]
+31 d2                           # xor edx,edx
+:fcmplp
+48 39 ca                        # cmp rcx,rdx
+0f 83 %fmatch                   # jbe fmatch (all bytes compared)
+41 8a 04 10                     # mov al,[r8+rdx]
+3a 04 16                        # cmp al,[rsi+rdx]
+0f 85 %findnext
+48 ff c2                        # inc rdx
+e9 %fcmplp
+:fmatch
+c3
+:findnext
+4d 8b 3f                        # mov r15,[r15] (follow link)
+e9 %findloop
+:findno
+c3
+# ---- create: build a dictionary header at HERE. rax=name length, r8=codeptr (0=code follows header).
+#      Returns r15=entry. Entry: [link][flags][namelen][name pad8][codeptr] then code. ----
+:create
+49 89 c1                        # mov r9,rax (length)
+4f 89 e7                        # mov r15,r12 (entry = HERE)
+4d 89 2f                        # mov [r15],r13 (link = LATEST)
+49 c7 47 08 00 00 00 00          # mov qword [r15+8],0 (flags)
+4d 89 4f 10                     # mov [r15+16],r9 (name length)
+ba 00 00 21 1c                  # mov edx,TOKENBUF
+49 8d 7f 18                     # lea rdi,[r15+24]
+31 c9                           # xor ecx,ecx
+:ccrloop
+4c 39 c9                        # cmp rcx,r9
+0f 83 %ccrdone
+8a 04 0a                        # mov al,[rdx+rcx]
+88 04 0f                        # mov [rdi+rcx],al
+48 ff c1                        # inc rcx
+e9 %ccrloop
+:ccrdone
+4c 89 c8                        # mov rax,r9
+48 83 c0 07                     # add rax,7
+48 83 e0 f8                     # and rax,-8
+49 8d 57 18                     # lea rdx,[r15+24]
+48 01 c2                        # add rdx,rax (codeptr slot)
+4d 85 c0                        # test r8,r8
+0f 85 %cprgiven
+48 8d 42 08                      # lea rax,[rdx+8]
+49 89 c0                         # mov r8,rax (default: code starts right after header)
+:cprgiven
+4c 89 02                        # mov [rdx],r8 (store codeptr)
+48 8d 42 08                      # lea rax,[rdx+8]
+49 89 c4                        # mov r12,rax (HERE = after header)
+4d 89 fd                        # mov r13,r15 (LATEST = entry)
+c3
+# ---- compilelit: emit code pushing rax: mov rax,imm64; sub r14,8; mov [r14],rax (17 bytes) ----
+:compilelit
+41 c6 04 24 48
+41 c6 44 24 01 b8
+49 89 44 24 02
+41 c6 44 24 0a 49
+41 c6 44 24 0b 83
+41 c6 44 24 0c ee
+41 c6 44 24 0d 08
+41 c6 44 24 0e 49
+41 c6 44 24 0f 89
+41 c6 44 24 10 06
+49 83 c4 11                      # add r12,17
+c3
+# ---- compilecall: emit call rel32 to codeptr in rax (5 bytes) ----
+:compilecall
+41 c6 04 24 e8
+49 8d 4c 24 05                  # lea rcx,[r12+5]
+48 29 c8                        # sub rax,rcx
+49 89 44 24 01                  # mov [r12+1],rax
+49 83 c4 05                     # add r12,5
+c3
+# ---- fmtnum: format rax as signed decimal; returns rsi=buffer, r10=length ----
+:fmtnum
+49 89 c0                        # mov r8,rax (value)
+4d 31 c9                        # xor r9,r9 (negative flag)
+4d 85 c0
+0f 89 %pnpos                    # jns pnpos
+49 c7 c1 01 00 00 00            # mov r9,1
+49 f7 d8                        # neg r8
+:pnpos
+bf 28 10 21 1c                  # mov edi,NUMBUF+40 (write backwards)
+4d 31 d2                        # xor r10,r10 (length)
+:pnlp
+48 31 d2                        # xor rdx,rdx
+4c 89 c0                        # mov rax,r8
+b9 0a 00 00 00                  # mov ecx,10
+48 f7 f1                        # div rcx
+49 89 c0                        # mov r8,rax (quotient)
+80 c2 30                        # add dl,0x30
+48 ff cf                        # dec rdi
+88 17                           # mov [rdi],dl
+49 ff c2                        # inc r10
+4c 89 c0                        # mov rax,r8 (quotient)
+48 85 c0
+0f 85 %pnlp                     # jnz pnlp
+4d 85 c9                        # test r9,r9
+0f 84 %pnwr
+48 ff cf                        # dec rdi
+c6 07 2d                        # mov byte [rdi],'-'
+49 ff c2                        # inc r10
+:pnwr
+48 89 fe                        # mov rsi,rdi (buffer)
+c3
+:printnum                       # print rax as signed decimal to stdout
+e8 %fmtnum
+b8 01 00 00 00                  # write(1,buf,r10)
+bf 01 00 00 00
+4c 89 d2                        # mov rdx,r10
+0f 05
+c3
+# ---- parsestring: copy chars from input until the delimiter in r8b into the string area; rax=addr, rdx=len ----
+:parsestring
+b8 00 21 21 1c                  # mov eax,INPTR
+48 8b 30                        # mov rsi,[rax]
+b8 08 21 21 1c                  # mov eax,INEND
+48 8b 38                        # mov rdi,[rax]
+b8 18 21 21 1c                  # mov eax,SSTRPTR (cell address)
+49 89 c3                        # mov r11,rax (keep cell address)
+48 8b 00                        # mov rax,[rax] (string address)
+49 89 c2                        # mov r10,rax (keep string address for return)
+48 31 c9                        # xor rcx,rcx
+8a 16                           # mov dl,[rsi]
+80 fa 20                        # cmp dl,0x20 (delimiter space)
+75 03                           # jne psloop (no space to skip)
+48 ff c6                        # inc rsi
+:psloop
+48 39 fe                        # cmp rsi,rdi
+0f 83 %psdone
+8a 16                           # mov dl,[rsi]
+44 38 c2                        # cmp dl,r8b (delimiter)
+0f 84 %psdone
+88 14 08                        # mov [rax+rcx],dl
+48 ff c1                        # inc rcx
+48 ff c6                        # inc rsi
+e9 %psloop
+:psdone
+48 ff c6                        # inc rsi (skip closing quote)
+b8 00 21 21 1c                  # mov eax,INPTR
+48 89 30                        # mov [rax],rsi
+49 01 0b                        # add [r11],rcx (reserve the bytes)
+48 89 ca                        # mov rdx,rcx (length)
+4c 89 d0                        # mov rax,r10 (return string address)
+c3
+# ---- install: build the dictionary from the word table at the end of this file ----
+:install
+48 8d 35 %wtab                   # lea rsi,[rip+wtab]
+:instlp
+4c 63 46 10                      # movsxd r8,dword [rsi+16] (rel32 to primitive code)
+48 8d 4e 14                  # lea rcx,[rsi+20]
+49 01 c8                        # add r8,rcx (codeptr = rel32 base + displacement)
+48 8b 06                        # mov rax,[rsi] (name length)
+48 85 c0
+0f 84 %instdone
+48 89 c1                        # mov rcx,rax (counter)
+51                               # push rcx (save length)
+48 8d 56 18                      # lea rdx,[rsi+24] (name in table)
+41 bb 00 00 21 1c               # mov r11d,TOKENBUF
+:icpylp
+48 85 c9                        # test rcx,rcx
+0f 84 %icpydone
+8a 02                           # mov al,[rdx]
+41 88 03                        # mov [r11],al
+48 ff c2                        # inc rdx
+49 ff c3                        # inc r11
+48 ff c9                        # dec rcx
+e9 %icpylp
+:icpydone
+58                               # pop rax (length)
+e8 %create                      # r8=codeptr (rax clobbered: create returns HERE)
+48 8b 4e 08                      # mov rcx,[rsi+8] (flags)
+49 09 4f 08                      # or [r15+8],rcx (set immediate bit)
+48 8b 06                        # mov rax,[rsi] (reload name length)
+48 83 c0 07                      # add rax,7
+48 83 e0 f8                     # and rax,-8
+48 8d 74 06 18                  # lea rsi,[rsi+rax+24] (next record)
+e9 %instlp
+:instdone
+c3
+# ===================== primitive words (each ends with ret) =====================
+:w_exit                         # EXIT: return from the current definition immediately
+48 83 c4 08                      # add rsp,8 (drop our caller's return address)
+c3
+:w_dup                           # DUP
+49 8b 06
+49 83 ee 08
+49 89 06
+c3
+:w_drop
+49 83 c6 08
+c3
+:w_swap
+49 8b 06
+49 8b 4e 08
+49 89 0e
+49 89 46 08
+c3
+:w_over
+49 8b 46 08
+49 83 ee 08
+49 89 06
+c3
+:w_rot                           # ROT ( a b c -- b c a )
+49 8b 06                        # rax = c
+49 8b 4e 08                     # rcx = b
+49 8b 56 10                     # rdx = a
+49 89 16                        # [r14]    = a (new top)
+49 89 46 08                     # [r14+8]  = c
+49 89 4e 10                     # [r14+16] = b
+c3
+:w_add
+49 8b 06
+49 01 46 08
+49 83 c6 08
+c3
+:w_sub
+49 8b 06
+49 29 46 08
+49 83 c6 08
+c3
+:w_mul
+49 8b 06
+49 0f af 46 08
+49 89 46 08
+49 83 c6 08
+c3
+:w_div                           # signed division
+49 8b 0e
+49 8b 46 08
+48 99                           # cqo
+48 f7 f9                        # idiv rcx
+49 89 46 08
+49 83 c6 08
+c3
+:w_mod                           # signed remainder (Python-style floor sign follows divisor)
+49 8b 0e
+49 8b 46 08
+48 99
+48 f7 f9
+49 89 56 08
+49 83 c6 08
+c3
+:w_eq
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 94 c0                        # sete al
+48 0f b6 c0
+49 89 06
+c3
+:w_ne
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 95 c0                        # setne al
+48 0f b6 c0
+49 89 06
+c3
+:w_lt
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 9c c0                        # setl al
+48 0f b6 c0
+49 89 06
+c3
+:w_gt
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 9f c0                        # setg al
+48 0f b6 c0
+49 89 06
+c3
+:w_le
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 9e c0                        # setle al
+48 0f b6 c0
+49 89 06
+c3
+:w_ge
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 9d c0                        # setge al
+48 0f b6 c0
+49 89 06
+c3
+:w_zeq                           # 0= (also NOT)
+49 8b 06
+48 85 c0
+0f 94 c0
+48 0f b6 c0
+49 89 06
+c3
+:w_not                          # NOT: logical negation of the top value
+49 8b 06
+48 85 c0
+0f 94 c0
+48 0f b6 c0
+49 89 06
+c3
+:w_and
+49 8b 06
+49 21 46 08
+49 83 c6 08
+c3
+:w_or
+49 8b 06
+49 09 46 08
+49 83 c6 08
+c3
+:w_xor
+49 8b 06
+49 31 46 08
+49 83 c6 08
+c3
+:w_fetch                         # @ ( addr -- value )
+49 8b 06
+48 8b 00
+49 89 06
+c3
+:w_store                         # ! ( value addr -- )
+49 8b 0e
+49 8b 46 08
+49 83 c6 10
+48 89 01
+c3
+:w_cfetch                        # C@
+49 8b 06
+0f b6 00
+49 89 06
+c3
+:w_cstore                        # C!
+49 8b 0e
+49 8b 46 08
+49 83 c6 10
+88 01
+c3
+:w_here                         # HERE ( -- addr ): next free data-space address
+49 83 ee 08
+4d 89 26
+c3
+:w_allot                        # ALLOT ( n -- ): claim n bytes of dynamic memory
+49 8b 06
+49 83 c6 08
+49 01 c4
+c3
+:w_cells                        # CELLS ( n -- n*8 )
+49 8b 06
+48 c1 e0 03
+49 89 06
+c3
+:w_i                            # I: current DO/LOOP index
+48 8b 44 24 08
+49 83 ee 08
+49 89 06
+c3
+:w_j                            # J: index of the enclosing DO/LOOP ([rsp]=ret, +8 inner idx, +16 inner limit, +24 outer idx)
+48 8b 44 24 18
+49 83 ee 08
+49 89 06
+c3
+:w_unloop                      # UNLOOP: discard DO/LOOP params (below our return address)
+48 8b 04 24                     # mov rax,[rsp] (return address)
+48 83 c4 18                     # add rsp,24 (return addr + index + limit)
+50                              # push rax
+c3
+:w_emit
+49 8b 06
+49 83 c6 08
+b9 00 20 21 1c                  # mov ecx,EMITBUF
+88 01                           # mov [rcx],al
+b8 01 00 00 00                  # write(1,EMITBUF,1)
+bf 01 00 00 00
+48 89 ce
+ba 01 00 00 00
+0f 05
+c3
+:w_cr
+b8 01 00 00 00
+bf 01 00 00 00
+48 8d 35 %nlchar
+ba 01 00 00 00
+0f 05
+c3
+:w_space
+b8 01 00 00 00
+bf 01 00 00 00
+48 8d 35 %spchar
+ba 01 00 00 00
+0f 05
+c3
+:w_type                          # TYPE ( addr len -- )
+49 8b 06                        # mov rax,len
+49 8b 4e 08                  # mov rcx,addr
+49 83 c6 10
+48 89 c2                        # mov rdx,rax (count) first
+b8 01 00 00 00
+bf 01 00 00 00
+48 89 ce
+0f 05
+c3
+:w_dot                          # . ( n -- ): print number + space
+49 8b 06
+49 83 c6 08
+e8 %printnum
+b8 01 00 00 00
+bf 01 00 00 00
+48 8d 35 %spchar
+ba 01 00 00 00
+0f 05
+c3
+:w_words                        # WORDS: print the dictionary
+4d 89 ef                        # mov r15,r13
+:wwlp
+4d 85 ff
+0f 84 %wwdone
+b8 01 00 00 00                  # write(1,name,len)
+bf 01 00 00 00
+49 8d 77 18                     # lea rsi,[r15+24]
+49 8b 57 10                      # mov rdx,[r15+16]
+0f 05
+b8 01 00 00 00                  # write(1," ",1)
+bf 01 00 00 00
+48 8d 35 %spchar
+ba 01 00 00 00
+0f 05
+4d 8b 3f                        # mov r15,[r15]
+e9 %wwlp
+:wwdone
+b8 01 00 00 00                  # write(1,"\n",1)
+bf 01 00 00 00
+48 8d 35 %nlchar
+ba 01 00 00 00
+0f 05
+c3
+:w_bye
+b8 3c 00 00 00                  # exit(0)
+31 ff
+0f 05
+:w_exec                         # EXECUTE ( codeaddr -- )
+49 8b 06
+49 83 c6 08
+ff d0
+c3
+:w_syscall                      # SYSCALL ( a1 a2 a3 a4 a5 a6 n -- result ): raw kernel FFI
+49 8b 06                        # mov rax,n
+4d 8b 4e 08                  # mov r9,a6
+4d 8b 46 10                  # mov r8,a5  [r14+16]
+4d 8b 56 18                  # mov r10,a4 [r14+24]
+49 8b 56 20                  # mov rdx,a3
+49 8b 76 28                  # mov rsi,a2
+49 8b 7e 30                  # mov rdi,a1
+49 83 c6 38                      # add r14,56
+0f 05
+49 83 ee 08
+49 89 06                        # push result
+c3
+# ===================== immediate words (compiler directives) =====================
+:prim_if                         # IF: compile ( pop ; test ; jz rel32 ), remember patch address
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+41 c6 04 24 49
+41 c6 44 24 01 8b
+41 c6 44 24 02 06
+41 c6 44 24 03 49
+41 c6 44 24 04 83
+41 c6 44 24 05 c6
+41 c6 44 24 06 08
+41 c6 44 24 07 48
+41 c6 44 24 08 85
+41 c6 44 24 09 c0
+41 c6 44 24 0a 0f
+41 c6 44 24 0b 84
+49 83 c4 10                      # add r12,12
+49 8d 44 24 fc                  # lea rax,[r12-4] (address of the rel32 field)
+48 83 eb 08                      # sub rbx,8
+48 89 03                        # mov [rbx],rax (push patch address)
+c3
+:prim_else                       # ELSE: compile jmp; patch IF's jz here; push new patch
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+41 c6 04 24 e9
+49 83 c4 05                      # add r12,5
+48 8b 03                        # mov rax,[rbx] (old patch)
+48 83 c3 08                      # add rbx,8
+48 8d 48 04                      # lea rcx,[rax+4]
+4c 89 e2                        # mov rdx,r12
+48 29 ca                        # sub rdx,rcx
+89 10                           # mov [rax],edx (patch jz -> here)
+49 8d 44 24 fc                  # lea rax,[r12-4] (jmp's rel32 field)
+48 83 eb 08
+48 89 03
+c3
+:prim_then                       # THEN: patch the outstanding jump to here
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+48 8b 03
+48 83 c3 08
+48 8d 48 04
+4c 89 e2
+48 29 ca
+89 10
+c3
+:prim_begin                      # BEGIN: push HERE (loop/branch target)
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+48 83 eb 08
+4c 89 23
+c3
+:prim_until                      # UNTIL: compile ( pop ; test ; jz back to BEGIN )
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+48 8b 03                        # mov rax,[rbx] (BEGIN address)
+48 83 c3 08
+41 c6 04 24 49
+41 c6 44 24 01 8b
+41 c6 44 24 02 06
+41 c6 44 24 03 49
+41 c6 44 24 04 83
+41 c6 44 24 05 c6
+41 c6 44 24 06 08
+41 c6 44 24 07 48
+41 c6 44 24 08 85
+41 c6 44 24 09 c0
+41 c6 44 24 0a 0f
+41 c6 44 24 0b 84
+49 83 c4 10                      # add r12,16
+4c 89 e2                        # mov rdx,r12
+48 29 d0                        # sub rax,rdx (rel32 = target - here)
+89 42 fc                      # mov [rdx-4],eax
+c3
+:prim_while                      # WHILE: compile jz-forward; push patch (BEGIN marker stays)
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+41 c6 04 24 49
+41 c6 44 24 01 8b
+41 c6 44 24 02 06
+41 c6 44 24 03 49
+41 c6 44 24 04 83
+41 c6 44 24 05 c6
+41 c6 44 24 06 08
+41 c6 44 24 07 48
+41 c6 44 24 08 85
+41 c6 44 24 09 c0
+41 c6 44 24 0a 0f
+41 c6 44 24 0b 84
+49 83 c4 10
+49 8d 44 24 fc
+48 83 eb 08
+48 89 03
+c3
+:prim_repeat                     # REPEAT: compile jmp back to BEGIN; patch WHILE's jz to here
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+48 8b 13                        # mov rdx,[rbx] (WHILE patch)
+48 83 c3 08
+48 8b 03                        # mov rax,[rbx] (BEGIN address)
+41 c6 04 24 e9
+49 83 c4 05                      # add r12,5
+4c 89 e1                        # mov rcx,r12
+48 29 c8                        # sub rax,rcx (jmp target = BEGIN)
+89 41 fc                      # mov [rcx-4],eax
+48 8d 4a 04                      # lea rcx,[rdx+4]
+4c 89 e0                        # mov rax,r12
+48 29 c8                        # sub rax,rcx (patch WHILE -> here)
+89 02                        # mov [rdx],rax
+48 83 c3 08                      # add rbx,8 (pop BEGIN)
+c3
+:prim_do                         # DO: compile ( pop index+limit; push on return stack )
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+41 c6 04 24 49
+41 c6 44 24 01 8b
+41 c6 44 24 02 06
+41 c6 44 24 03 49
+41 c6 44 24 04 8b
+41 c6 44 24 05 4e
+41 c6 44 24 06 08
+41 c6 44 24 07 49
+41 c6 44 24 08 83
+41 c6 44 24 09 c6
+41 c6 44 24 0a 10
+41 c6 44 24 0b 51                # push rcx (limit)
+41 c6 44 24 0c 50                # push rax (index)
+49 83 c4 0d                      # add r12,13
+48 83 eb 08
+4c 89 23                        # push HERE (loop body start)
+c3
+:prim_loop                       # LOOP: compile ( inc index; cmp limit; jl body; pop params )
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+48 8b 03                        # mov rax,[rbx] (body start)
+48 83 c3 08
+41 c6 04 24 48
+41 c6 44 24 01 8b
+41 c6 44 24 02 04
+41 c6 44 24 03 24
+41 c6 44 24 04 48
+41 c6 44 24 05 ff
+41 c6 44 24 06 c0
+41 c6 44 24 07 48
+41 c6 44 24 08 89
+41 c6 44 24 09 04
+41 c6 44 24 0a 24
+41 c6 44 24 0b 48
+41 c6 44 24 0c 8b
+41 c6 44 24 0d 4c
+41 c6 44 24 0e 24
+41 c6 44 24 0f 08
+41 c6 44 24 10 48
+41 c6 44 24 11 39
+41 c6 44 24 12 c8
+41 c6 44 24 13 0f
+41 c6 44 24 14 8c
+41 c6 44 24 19 48                # add rsp,16 (loop exit)
+41 c6 44 24 1a 83
+41 c6 44 24 1b c4
+41 c6 44 24 1c 10
+49 83 c4 1d                      # add r12,29
+4c 89 e1                        # mov rcx,r12
+48 29 c8                        # sub rax,rcx
+48 83 c0 04                      # add rax,4 (rel32 = target - here + 4)
+89 41 f8                      # mov [rcx-8],rax
+c3
+:prim_variable                   # VARIABLE <name>: define a word pushing its data address
+e8 %nexttoken
+48 85 c0
+0f 84 %vexit
+4d 31 c0                        # xor r8,r8
+e8 %create
+41 c6 04 24 48                  # mov rax,imm64 <data>; sub r14,8; mov [r14],rax; ret (18 bytes)
+41 c6 44 24 01 b8
+49 8d 44 24 12                  # lea rax,[r12+18] (data cell follows the stub)
+49 89 44 24 02
+41 c6 44 24 0a 49
+41 c6 44 24 0b 83
+41 c6 44 24 0c ee
+41 c6 44 24 0d 08
+41 c6 44 24 0e 49
+41 c6 44 24 0f 89
+41 c6 44 24 10 06
+41 c6 44 24 11 c3
+49 83 c4 1a                      # add r12,26 (stub + one data cell)
+c3
+:vexit
+c3
+:prim_tick                      # ' <name> ( -- codeaddr )
+e8 %nexttoken
+e8 %find
+4d 85 ff
+0f 84 %ticknull
+49 8b 4f 10
+48 83 c1 07
+48 83 e1 f8
+49 8d 54 0f 18
+48 8b 02
+49 83 ee 08
+49 89 06
+c3
+:ticknull
+49 83 ee 08
+49 c7 06 00 00 00 00
+c3
+:prim_squote                     # S" text" : compile/push ( addr len )
+41 b0 22                        # mov r8b,'"'
+e8 %parsestring                   # rax=addr rdx=len
+48 85 ed
+0f 84 %sq_interp
+e8 %compilelit                  # compile addr
+48 89 d0                        # mov rax,rdx
+e8 %compilelit                  # compile len
+c3
+:sq_interp                       # interpreting: push both
+49 83 ee 08
+49 89 06
+48 89 d0
+49 83 ee 08
+49 89 06
+c3
+:prim_dotq                       # ." text" : compile ( addr len ) then call TYPE
+41 b0 22                        # mov r8b,'"'
+e8 %parsestring
+48 85 ed                        # test rbp,rbp
+0f 84 %dq_interp                # jz dq_interp (interpreting: print now)
+e8 %compilelit
+48 89 d0
+e8 %compilelit
+b8 00 00 21 1c                  # mov eax,TOKENBUF
+48 b9 74 79 70 65 00 00 00 00    # movabs rcx,"type"
+48 89 08                        # mov [rax],rcx
+b8 10 21 21 1c                  # mov eax,TOKLEN
+48 c7 00 04 00 00 00            # mov qword [rax],4
+e8 %find
+4d 85 ff
+0f 84 %dqskip
+49 8b 4f 10
+48 83 c1 07
+48 83 e1 f8
+49 8d 54 0f 18
+48 8b 02
+e8 %compilecall
+:dq_interp                       # interpreting: push ( addr len ) and call TYPE
+49 83 ee 08
+49 89 06
+48 89 d0
+49 83 ee 08
+49 89 06
+e8 %w_type
+c3
+:dqskip
+c3
+# ===================== Forge 1.0 primitives =====================
+:prim_colon                      # : <name> — start a definition. A real word, so code can define code.
+e8 %nexttoken
+48 85 c0
+0f 84 %errnoname
+4d 31 c0                        # xor r8,r8 (code follows header)
+e8 %create
+48 c7 c5 01 00 00 00            # mov rbp,1 (STATE=compiling)
+c3
+:prim_semi                       # ; (immediate, compile-only) — compile ret, back to interpreting
+41 c6 04 24 c3                  # mov byte [r12],0xc3
+49 ff c4                        # inc r12
+48 31 ed                        # xor rbp,rbp
+c3
+:prim_ploop                      # +LOOP ( step -- ): index += step; loop while index < limit (positive steps)
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+48 8b 03                        # mov rax,[rbx] (body start)
+48 83 c3 08
+41 c6 04 24 49
+41 c6 44 24 01 8b
+41 c6 44 24 02 06
+41 c6 44 24 03 49
+41 c6 44 24 04 83
+41 c6 44 24 05 c6
+41 c6 44 24 06 08
+41 c6 44 24 07 48
+41 c6 44 24 08 03
+41 c6 44 24 09 04
+41 c6 44 24 0a 24
+41 c6 44 24 0b 48
+41 c6 44 24 0c 89
+41 c6 44 24 0d 04
+41 c6 44 24 0e 24
+41 c6 44 24 0f 48
+41 c6 44 24 10 8b
+41 c6 44 24 11 4c
+41 c6 44 24 12 24
+41 c6 44 24 13 08
+41 c6 44 24 14 48
+41 c6 44 24 15 39
+41 c6 44 24 16 c8
+41 c6 44 24 17 0f
+41 c6 44 24 18 8c
+41 c6 44 24 1d 48
+41 c6 44 24 1e 83
+41 c6 44 24 1f c4
+41 c6 44 24 20 10
+49 83 c4 21                     # add r12,33
+4c 89 e1                        # mov rcx,r12
+48 29 c8                        # sub rax,rcx
+48 83 c0 04                     # add rax,4 (rel32 = body - (field+4), field = here-8)
+89 41 f8                        # mov [rcx-8],eax
+c3
+:w_fadd                          # F+ ( a b -- a+b )   IEEE doubles live on the same stack as integers
+f2 41 0f 10 46 08               # movsd xmm0,[r14+8]
+f2 41 0f 58 06                  # addsd xmm0,[r14]
+49 83 c6 08
+f2 41 0f 11 06                  # movsd [r14],xmm0
+c3
+:w_fsub                          # F-
+f2 41 0f 10 46 08
+f2 41 0f 5c 06                  # subsd
+49 83 c6 08
+f2 41 0f 11 06
+c3
+:w_fmul                          # F*
+f2 41 0f 10 46 08
+f2 41 0f 59 06                  # mulsd
+49 83 c6 08
+f2 41 0f 11 06
+c3
+:w_fdiv                          # F/
+f2 41 0f 10 46 08
+f2 41 0f 5e 06                  # divsd
+49 83 c6 08
+f2 41 0f 11 06
+c3
+:w_fsqrt                         # FSQRT
+f2 41 0f 51 06                  # sqrtsd xmm0,[r14]
+f2 41 0f 11 06
+c3
+:w_flt                           # F< ( a b -- flag )
+f2 41 0f 10 46 08               # movsd xmm0,[r14+8] (a)
+f2 41 0f 10 0e                  # movsd xmm1,[r14]   (b)
+49 83 c6 08                     # (add clobbers flags, so compare afterwards)
+66 0f 2f c1                     # comisd xmm0,xmm1
+0f 92 c0                        # setb al
+48 0f b6 c0
+49 89 06
+c3
+:w_fgt                           # F>
+f2 41 0f 10 46 08               # movsd xmm0,[r14+8] (a)
+f2 41 0f 10 0e                  # movsd xmm1,[r14]   (b)
+49 83 c6 08                     # (add clobbers flags, so compare afterwards)
+66 0f 2f c1                     # comisd xmm0,xmm1
+0f 97 c0                        # seta al
+48 0f b6 c0
+49 89 06
+c3
+:w_feq                           # F= (exact; NaN compares unordered)
+f2 41 0f 10 46 08               # movsd xmm0,[r14+8] (a)
+f2 41 0f 10 0e                  # movsd xmm1,[r14]   (b)
+49 83 c6 08                     # (add clobbers flags, so compare afterwards)
+66 0f 2f c1                     # comisd xmm0,xmm1
+0f 94 c0                        # sete al
+48 0f b6 c0
+49 89 06
+c3
+:w_stof                          # S>F ( n -- f )
+f2 49 0f 2a 06                  # cvtsi2sd xmm0,qword [r14]
+f2 41 0f 11 06
+c3
+:w_ftos                          # F>S ( f -- n ) truncate toward zero
+f2 49 0f 2c 06                  # cvttsd2si rax,[r14]
+49 89 06
+c3
+:w_fround                        # FROUND ( f -- n ) round to nearest even
+f2 49 0f 2d 06                  # cvtsd2si rax,[r14]
+49 89 06
+c3
+:w_tor                           # >R ( n -- ) ( R: -- n )
+59                              # pop rcx (our return address)
+49 8b 06
+49 83 c6 08
+50                              # push the value
+ff e1                           # jmp rcx
+:w_fromr                         # R> ( -- n ) ( R: n -- )
+59
+58
+49 83 ee 08
+49 89 06
+ff e1
+:w_rfetch                        # R@
+48 8b 44 24 08
+49 83 ee 08
+49 89 06
+c3
+:w_spfetch                       # SP@ ( -- addr of top item )
+4c 89 f0
+49 83 ee 08
+49 89 06
+c3
+:w_latest                        # LATEST ( -- entry of most recent definition )
+49 83 ee 08
+4d 89 2e
+c3
+:w_statefetch                    # STATE@ ( -- 0|1 )
+49 83 ee 08
+49 89 2e
+c3
+:prim_lbrack                     # [ : switch to interpreting (immediate)
+48 31 ed
+c3
+:w_rbrack                        # ] : switch to compiling
+48 c7 c5 01 00 00 00
+c3
+:w_lshift                        # LSHIFT ( n count -- n<<count )
+49 8b 0e
+49 83 c6 08
+49 d3 26
+c3
+:w_rshift                        # RSHIFT (logical)
+49 8b 0e
+49 83 c6 08
+49 d3 2e
+c3
+:w_invert                        # INVERT (bitwise not)
+49 f7 16
+c3
+:w_negate                        # NEGATE
+49 f7 1e
+c3
+:w_ult                           # U< unsigned less-than
+49 8b 06
+49 8b 4e 08
+49 83 c6 08
+48 39 c1
+0f 92 c0                        # setb al
+48 0f b6 c0
+49 89 06
+c3
+:w_inc                           # 1+
+49 ff 06
+c3
+:w_dec                           # 1-
+49 ff 0e
+c3
+:prim_literal                    # LITERAL ( n -- ) compile a literal (immediate)
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+49 8b 06
+49 83 c6 08
+e8 %compilelit
+c3
+:w_compilecomma                  # COMPILE, ( xt -- ) compile a call to xt
+49 8b 06
+49 83 c6 08
+e8 %compilecall
+c3
+:w_token                         # TOKEN ( -- addr len ) next whitespace-delimited token from the input
+e8 %nexttoken
+49 83 ee 10
+49 c7 46 08 00 00 21 1c         # mov qword [r14+8],TOKENBUF
+49 89 06
+c3
+:w_parse                         # PARSE ( delim -- addr len ) copy input up to delim into the string area
+49 8b 06
+49 83 c6 08
+41 88 c0                        # mov r8b,al
+e8 %parsestring
+49 83 ee 10
+49 89 46 08
+49 89 16
+c3
+:w_find                          # FIND ( addr len -- entry|0 )
+49 8b 0e                        # rcx = len
+49 8b 76 08                     # rsi = addr
+49 83 c6 08
+bf 00 00 21 1c                  # rdi = TOKENBUF
+b8 10 21 21 1c
+48 89 08                        # TOKLEN = len
+31 d2
+:fdcp
+48 39 ca
+0f 83 %fdcpd
+8a 04 16                        # mov al,[rsi+rdx]
+88 04 17                        # mov [rdi+rdx],al
+48 ff c2
+e9 %fdcp
+:fdcpd
+e8 %find
+4d 89 3e                        # mov [r14],r15
+c3
+:prim_create                     # CREATE <name>: define a word that pushes the address right after itself
+e8 %nexttoken
+48 85 c0
+0f 84 %errnoname
+4d 31 c0
+e8 %create
+41 c6 04 24 48                  # mov rax,imm64 <here+18>; sub r14,8; mov [r14],rax; ret (18 bytes)
+41 c6 44 24 01 b8
+49 8d 44 24 12
+49 89 44 24 02
+41 c6 44 24 0a 49
+41 c6 44 24 0b 83
+41 c6 44 24 0c ee
+41 c6 44 24 0d 08
+41 c6 44 24 0e 49
+41 c6 44 24 0f 89
+41 c6 44 24 10 06
+41 c6 44 24 11 c3
+49 83 c4 12                     # add r12,18
+c3
+:w_include                       # INCLUDE <file>
+e8 %nexttoken
+48 85 c0
+0f 84 %errnoname
+b9 00 00 21 1c
+c6 04 01 00                     # NUL-terminate the token
+48 89 cf
+e8 %loadfile
+c3
+:w_pinclude                      # (INCLUDE) ( zaddr -- ) load a file by NUL-terminated path
+49 8b 3e
+49 83 c6 08
+e8 %loadfile
+c3
+:w_abort                         # ABORT: error reset
+e9 %aborterr
+:prim_brtick                     # ['] <name> : compile the xt as a literal (immediate)
+48 85 ed                        # compile-only: error if interpreting
+0f 84 %compileonly
+e8 %nexttoken
+e8 %find
+4d 85 ff
+0f 84 %bticknull
+49 8b 4f 10
+48 83 c1 07
+48 83 e1 f8
+49 8d 54 0f 18
+48 8b 02
+e8 %compilelit
+c3
+:bticknull
+e9 %undeferr
+:w_pdot                          # (.) ( n -- ) print without trailing space
+49 8b 06
+49 83 c6 08
+e8 %printnum
+c3
+:w_cmove                         # CMOVE ( src dst n -- )
+49 8b 0e
+49 8b 7e 08
+49 8b 76 10
+49 83 c6 18
+:cmlp
+48 85 c9
+0f 84 %cmdone
+8a 06
+88 07
+48 ff c6
+48 ff c7
+48 ff c9
+e9 %cmlp
+:cmdone
+c3
+:w_fsin                          # FSIN ( f -- sin f )   x87
+41 dd 06                        # fld qword [r14]
+d9 fe                           # fsin
+41 dd 1e                        # fstp qword [r14]
+c3
+:w_fcos                          # FCOS
+41 dd 06
+d9 ff                           # fcos
+41 dd 1e
+c3
+:w_fatan2                        # FATAN2 ( y x -- atan2(y,x) )
+41 dd 46 08                     # fld y
+41 dd 06                        # fld x
+d9 f3                           # fpatan: ST0 = atan(ST1/ST0), pops
+49 83 c6 08
+41 dd 1e
+c3
+:w_fln                           # FLN ( f -- ln f )
+d9 ed                           # fldln2
+41 dd 06                        # fld f
+d9 f1                           # fyl2x: ST0 = ln2 * log2(f)
+41 dd 1e
+c3
+:w_fexp                          # FEXP ( f -- e^f )  via 2^(f*log2 e) = 2^int * (2^frac)
+41 dd 06                        # fld f
+d9 ea                           # fldl2e
+de c9                           # fmulp -> t = f*log2(e)
+d9 c0                           # fld st0
+d9 fc                           # frndint -> ST0=int(t) ST1=t
+dc e9                           # fsub st1,st0 -> ST1 = t - int = frac
+d9 c9                           # fxch -> ST0=frac ST1=int
+d9 f0                           # f2xm1 -> 2^frac - 1
+d9 e8                           # fld1
+de c1                           # faddp -> 2^frac
+d9 fd                           # fscale -> 2^frac * 2^int
+41 dd 1e                        # fstp qword [r14]
+dd d8                           # fstp st0 (discard int)
+c3
+# ===================== data =====================
+:prompt
+3e 20
+:banner
+46 6f 72 67 65 20 31 2e 30 20 2d 20 6c 61 6e 67 75 61 67 65 20 65 6e 67 69 6e 65 20 6f 6e 20 72 61 77 20 6d 61 63 68 69 6e 65 20 63 6f 64 65 0a
+:emsg
+66 6f 72 67 65 3a 20 75 6e 64 65 66 69 6e 65 64 3a 20
+:emsg2
+66 6f 72 67 65 3a 20 6e 61 6d 65 20 65 78 70 65 63 74 65 64
+:emsg3
+66 6f 72 67 65 3a 20 61 62 6f 72 74                              # "forge: abort" (12)
+:emsg4
+66 6f 72 67 65 3a 20 63 6f 6d 70 69 6c 65 2d 6f 6e 6c 79 3a 20                 # "forge: compile-only: " (21)
+:emsg5
+66 6f 72 67 65 3a 20 73 74 61 63 6b 20 75 6e 64 65 72 66 6c 6f 77              # "forge: stack underflow" (22)
+:elin
+20 28 6c 69 6e 65 20                                             # " (line " (7)
+:eclose
+29 0a                                                            # ")\n"
+:eopen
+66 6f 72 67 65 3a 20 63 61 6e 6e 6f 74 20 6f 70 65 6e 20 66 69 6c 65 3a 20  # "forge: cannot open file: " (25)
+:enl
+0a
+:spchar
+20
+:nlchar
+0a
+:mmmsg
+66 6f 72 67 65 3a 20 6d 6d 61 70 20 66 61 69 6c 65 64 0a
+:fone
+00 00 00 00 00 00 f0 3f                                          # 1.0
+:ften
+00 00 00 00 00 00 24 40                                          # 10.0
+# ---- word table: [len:8][flags:8][codeptr rel32:4][pad:4][name pad8]; flags bit0 = immediate ----
+:wtab
+04 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  %w_exit  00 00 00 00  65 78 69 74 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_dup   00 00 00 00  64 75 70 00 00 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_drop  00 00 00 00  64 72 6f 70 00 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_swap  00 00 00 00  73 77 61 70 00 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_over  00 00 00 00  6f 76 65 72 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_rot   00 00 00 00  72 6f 74 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_add   00 00 00 00  2b 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_sub   00 00 00 00  2d 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_mul   00 00 00 00  2a 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_div   00 00 00 00  2f 00 00 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_mod   00 00 00 00  6d 6f 64 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_eq    00 00 00 00  3d 00 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_ne    00 00 00 00  3c 3e 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_lt    00 00 00 00  3c 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_gt    00 00 00 00  3e 00 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_le    00 00 00 00  3c 3d 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_ge    00 00 00 00  3e 3d 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_zeq   00 00 00 00  30 3d 00 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_not   00 00 00 00  6e 6f 74 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_and   00 00 00 00  61 6e 64 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_or    00 00 00 00  6f 72 00 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_xor   00 00 00 00  78 6f 72 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fetch 00 00 00 00  40 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_store 00 00 00 00  21 00 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_cfetch 00 00 00 00  63 40 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_cstore 00 00 00 00  63 21 00 00 00 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_here  00 00 00 00  68 65 72 65 00 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_allot 00 00 00 00  61 6c 6c 6f 74 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_cells 00 00 00 00  63 65 6c 6c 73 00 00 00
+01 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  %w_i     00 00 00 00  69 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  %w_j     00 00 00 00  6a 00 00 00 00 00 00 00
+06 00 00 00 00 00 00 00  02 00 00 00 00 00 00 00  %w_unloop 00 00 00 00  75 6e 6c 6f 6f 70 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_emit  00 00 00 00  65 6d 69 74 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_cr    00 00 00 00  63 72 00 00 00 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_space 00 00 00 00  73 70 61 63 65 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_type  00 00 00 00  74 79 70 65 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_dot   00 00 00 00  2e 00 00 00 00 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_words 00 00 00 00  77 6f 72 64 73 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_bye   00 00 00 00  62 79 65 00 00 00 00 00
+07 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_exec  00 00 00 00  65 78 65 63 75 74 65 00
+07 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_syscall 00 00 00 00  73 79 73 63 61 6c 6c 00
+08 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_variable 00 00 00 00  76 61 72 69 61 62 6c 65
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %prim_tick 00 00 00 00  27 00 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_squote 00 00 00 00  73 22 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_dotq 00 00 00 00  2e 22 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_if 00 00 00 00  69 66 00 00 00 00 00 00
+04 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_else 00 00 00 00  65 6c 73 65 00 00 00 00
+04 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_then 00 00 00 00  74 68 65 6e 00 00 00 00
+05 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_begin 00 00 00 00  62 65 67 69 6e 00 00 00
+05 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_until 00 00 00 00  75 6e 74 69 6c 00 00 00
+05 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_while 00 00 00 00  77 68 69 6c 65 00 00 00
+06 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_repeat 00 00 00 00  72 65 70 65 61 74 00 00
+02 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_do 00 00 00 00  64 6f 00 00 00 00 00 00
+04 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_loop 00 00 00 00  6c 6f 6f 70 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fadd 00 00 00 00  66 2b 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fsub 00 00 00 00  66 2d 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fmul 00 00 00 00  66 2a 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fdiv 00 00 00 00  66 2f 00 00 00 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fsqrt 00 00 00 00  66 73 71 72 74 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_flt 00 00 00 00  66 3c 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fgt 00 00 00 00  66 3e 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_feq 00 00 00 00  66 3d 00 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_stof 00 00 00 00  73 3e 66 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_ftos 00 00 00 00  66 3e 73 00 00 00 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fround 00 00 00 00  66 72 6f 75 6e 64 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_tor 00 00 00 00  3e 72 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fromr 00 00 00 00  72 3e 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_rfetch 00 00 00 00  72 40 00 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_spfetch 00 00 00 00  73 70 40 00 00 00 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_latest 00 00 00 00  6c 61 74 65 73 74 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_statefetch 00 00 00 00  73 74 61 74 65 40 00 00
+01 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_lbrack 00 00 00 00  5b 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_rbrack 00 00 00 00  5d 00 00 00 00 00 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_lshift 00 00 00 00  6c 73 68 69 66 74 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_rshift 00 00 00 00  72 73 68 69 66 74 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_invert 00 00 00 00  69 6e 76 65 72 74 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_negate 00 00 00 00  6e 65 67 61 74 65 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_ult 00 00 00 00  75 3c 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_inc 00 00 00 00  31 2b 00 00 00 00 00 00
+02 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_dec 00 00 00 00  31 2d 00 00 00 00 00 00
+07 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_literal 00 00 00 00  6c 69 74 65 72 61 6c 00
+08 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_compilecomma 00 00 00 00  63 6f 6d 70 69 6c 65 2c
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_token 00 00 00 00  74 6f 6b 65 6e 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_parse 00 00 00 00  70 61 72 73 65 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_find 00 00 00 00  66 69 6e 64 00 00 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %prim_create 00 00 00 00  63 72 65 61 74 65 00 00
+07 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_include 00 00 00 00  69 6e 63 6c 75 64 65 00
+09 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_pinclude 00 00 00 00  28 69 6e 63 6c 75 64 65 29 00 00 00 00 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_abort 00 00 00 00  61 62 6f 72 74 00 00 00
+03 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_brtick 00 00 00 00  5b 27 5d 00 00 00 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_pdot 00 00 00 00  28 2e 29 00 00 00 00 00
+05 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_cmove 00 00 00 00  63 6d 6f 76 65 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fsin 00 00 00 00  66 73 69 6e 00 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fcos 00 00 00 00  66 63 6f 73 00 00 00 00
+06 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fatan2 00 00 00 00  66 61 74 61 6e 32 00 00
+03 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fln 00 00 00 00  66 6c 6e 00 00 00 00 00
+04 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %w_fexp 00 00 00 00  66 65 78 70 00 00 00 00
+05 00 00 00 00 00 00 00  01 00 00 00 00 00 00 00  %prim_ploop 00 00 00 00  2b 6c 6f 6f 70 00 00 00
+01 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  %prim_colon 00 00 00 00  3a 00 00 00 00 00 00 00
+01 00 00 00 00 00 00 00  03 00 00 00 00 00 00 00  %prim_semi 00 00 00 00  3b 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00

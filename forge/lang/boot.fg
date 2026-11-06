@@ -1,0 +1,5 @@
+\ boot.fg — Forge 2 entry.  The kernel includes every argv file as Forge source; boot-main runs the
+\ remaining arguments that do not end in ".fg" as Python-like programs, then exits.
+: ends-fg? ( zaddr -- f ) zcount dup 3 < if 2drop 0 exit then + 3 - 3 s" .fg" str= ;
+: boot-main ( -- ) argc 1 begin 2dup > while dup argv dup ends-fg? if drop else run-file then 1+ repeat 2drop ;
+boot-main bye

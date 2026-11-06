@@ -1,0 +1,17 @@
+: check ( got expected -- ) 2dup = if 2drop ." ok " else ." FAIL " swap (.) ."  expected " (.) cr abort then ;
+s" hello" mkstr constant h   s" world" mkstr constant w
+h s.len 5 check
+h w s-concat s>al type cr
+h h s= 1 check  h w s= 0 check  h s" hello" mkstr s= 1 check
+h w s-cmp -1 check  w h s-cmp 1 check  h h s-cmp 0 check  s" hell" mkstr h s-cmp -1 check
+h 1 3 s-sub s>al type cr
+h s" ll" mkstr s-find 2 check   h s" lo" mkstr s-find 3 check  h s" x" mkstr s-find -1 check  h s" " mkstr s-find 0 check
+s" ab" mkstr 3 s-repeat s>al type cr
+2 mklist constant L
+10 0 L l-append  20 0 L l-append  30 0 L l-append  L l.len 3 check  L 2 l-at 2@ 0 check 30 check  L 8 + @ 4 check
+L L l-concat dup l.len 6 check 5 l-at @ 30 check
+L 1 2 l-copy dup l.len 2 check 0 l-at @ 20 check
+L 2 l-repeat dup l.len 6 check 3 l-at @ 10 check
+100 alloc 100 alloc swap - 104 check
+1000 alloc0 dup 999 + c@ 0 check drop
+cr ." rt part 1 ok" cr bye

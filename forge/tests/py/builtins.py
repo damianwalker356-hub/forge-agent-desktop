@@ -1,0 +1,61 @@
+import math
+print(str(12), str(1.5), str([1, "a"]), repr("hi"), type(3), type(2.0), type("s"), type([]), type({}), type(()), type(True), type(None))
+print(int("42"), int(" -7 "), int(3.99), int(-3.99), int(True), float("2.5"), float("1e3"), float(" -0.125"), float(7), float("inf"), float("-inf"))
+print(bool(0), bool(3), bool(""), bool("x"), bool([]), bool([0]), bool(None), bool(0.0))
+print(abs(-5), abs(-2.5), abs(3), round(2.5), round(3.5), round(-2.5), round(2.675, 2), round(1234.5678, -2), round(7, 1), round(0.125, 2), round(1.0 / 3, 4))
+print(divmod(17, 5), divmod(-17, 5), pow(2, 10), pow(2, -1), min(3, 1, 2), max(3, 1, 2), min([4, 9, 2]), max("b", "a"), sum([1, 2, 3]), sum([0.5, 0.25]), sum([1, 2], 10))
+print(ord("A"), chr(66), hex(255), hex(-16), hex(0), len("hey"), len([1, 2]), len({}), len((1,)))
+print(list("abc"), list((1, 2)), tuple([1, 2]), list({"a": 1, "b": 2}), list(range(5)), list(range(2, 10, 3)), list(range(5, 0, -2)))
+print(list(reversed([1, 2, 3])), list(enumerate(["a", "b"])), list(enumerate(["a", "b"], 1)), list(zip([1, 2, 3], ["x", "y"])), any([0, 0, 1]), any([]), all([1, 2]), all([1, 0]))
+print(sorted([3, 1, 2]), sorted(["pear", "apple", "fig"]), sorted([2.5, 1, 3]), sorted([]), sorted([(2, "b"), (1, "z"), (1, "a")]))
+s = "  Hello World  "
+print(s.strip(), s.lstrip() + "|", s.rstrip() + "|", s.upper(), s.lower(), "a,b,,c".split(","), "  x  y z ".split(), "-".join(["a", "b", "c"]), "".join([]))
+print("hello".find("l"), "hello".find("z"), "hello".index("e"), "hello".count("l"), "hello".replace("l", "L"), "hello".replace("ll", ""), "hello".startswith("he"), "hello".endswith("lo"), "hello".startswith("lo"))
+print("123".isdigit(), "12a".isdigit(), "abc".isalpha(), "".isalpha(), "   ".isspace(), "ab1".isalnum(), "hello world".capitalize(), "hello world".title(), "42".zfill(5), "-42".zfill(5), "hi".center(6) + "|")
+print("{} + {} = {}".format(1, 2, 3), "{:.2f}".format(3.14159), "{:>6}|{:<6}|{:^6}|".format("a", "b", "c"), "{:05d}".format(42), "{:+d}".format(5), "{:e}".format(12345.678), "{:.3e}".format(0.00123), "{{x}}".format())
+print("%d items at %.2f = %s" % (3, 1.5, "ok"), "%5d|%-5d|%05d" % (42, 42, 42), "%x %o" % (255, 8) if False else "%x" % 255, "%s %r" % ("a", "a"), "100%%" % (), "%g %g %g" % (0.5, 1e-7, 123456789.0), "%.3g" % 3.14159)
+x = 3
+y = 2.5
+name = "forge"
+print(f"{x} and {y} and {name}", f"{x + 1}", f"{y:.3f}", f"{name:>8}|", f"{x * y:08.2f}", f"{{literal}}", f"{name.upper()} {len(name)}", f"{[1, 2][0]}", f"{'quoted'}")
+L = [3, 1, 2]
+L.append(4)
+L.extend([5, 6])
+L.insert(0, 0)
+L.insert(100, 9)
+L.insert(-1, 8)
+print(L, L.pop(), L.pop(0), L, L.index(5), L.count(1), [1, 1, 2].count(1))
+L.remove(8)
+L.reverse()
+print(L)
+L.sort()
+print(L, L.copy(), L.copy() is L)
+M = [[1, 2], [3]]
+M2 = M.copy()
+M2.append(7)
+print(M, M2)
+L.clear()
+print(L, [1, 2] + [3], [0] * 3, (1, 2) * 2)
+D = {"a": 1, "b": 2}
+print(list(D.keys()), list(D.values()), list(D.items()), D.get("a"), D.get("z"), D.get("z", 0), D.pop("a"), D, D.pop("q", "dflt"), D.setdefault("n", 5), D.setdefault("n", 9), D)
+D.update({"b": 20, "c": 30})
+print(D, len(D), D.copy(), "c" in D, "zz" not in D)
+D.clear()
+print(D)
+print(math.sqrt(16), math.sqrt(2), math.pi, math.e, math.tau, math.inf, -math.inf, math.floor(2.7), math.ceil(2.1), math.floor(-2.7), math.ceil(-2.1), math.fabs(-3), math.trunc(-2.7))
+print(math.sin(0), math.cos(0), round(math.sin(math.pi / 2), 6), round(math.tan(1), 6), round(math.atan(1), 6), round(math.atan2(1, 1), 6), round(math.asin(0.5), 6), round(math.acos(0.5), 6))
+print(round(math.log(math.e), 6), round(math.log(8, 2), 6), round(math.log10(1000), 6), round(math.log2(1024), 6), round(math.exp(1), 6), math.hypot(3, 4), round(math.degrees(math.pi), 6), round(math.radians(180), 6))
+print(math.gcd(12, 18), math.factorial(10), math.isnan(math.nan), math.isinf(math.inf), math.isnan(1.0), math.pow(2, 10), 2 ** 10, 2.0 ** 3, 10 ** -2, (-2) ** 3, 2 ** 62)
+print(1e100 * 1e100, -1e300 * 1e300, 5 / 2, 5 // 2, -5 // 2, 5 % 3, -5 % 3, 5.5 % 2, 2 ** 100 if False else 0)
+import random
+random.seed(1)
+r = random.random()
+n = random.randint(1, 6)
+c = random.choice([1, 2, 3])
+u = random.uniform(1, 2)
+print(0 <= r < 1, 1 <= n <= 6, c in [1, 2, 3], 1 <= u <= 2)
+import time
+t0 = time.time()
+print(t0 > 1600000000, time.perf_counter() >= 0)
+import sys
+print(sys.maxsize)

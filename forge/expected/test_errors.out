@@ -1,0 +1,9 @@
+Forge 1.0 - language engine on raw machine code
+> forge: undefined: bogus (line 1)
+forge: undefined: half-built (line 2)
+6 
+42 
+forge: stack underflow (line 6)
+still alive
+forge: compile-only: do (line 8)
+2 

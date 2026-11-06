@@ -1,0 +1,5 @@
+1. times/end:        1 2 3 4 5 
+2. struct:           cylinder is 24 bytes, cyl.rod at offset 16 
+3. DSL spec:         6 cyl, 2997 cc, redline 7200 
+4. generated word:   poly(10) = 321  poly(-2) = 9 
+5. case/of:          intake compression power exhaust 
